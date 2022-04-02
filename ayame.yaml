@@ -1,0 +1,19 @@
+namespaces:
+  - name: ns1 # 10.0.0.1
+    devices:
+      - name: link1
+        cidr: 10.0.0.1/24
+    commands:
+      - ip link set up $(link1)
+      - iptables -A OUTPUT -p tcp -d 10.0.0.2 -j DROP # Not to process tcp in Linux's proto stack
+      - iptables -A INPUT -p tcp -d 10.0.0.1 -j DROP # Not to process tcp in Linux's proto stack
+  - name: ns2 # 10.0.0.2
+    devices:
+      - name: link1
+        cidr: 10.0.0.2/24
+    commands:
+      - ip link set up $(link1)
+      
+links:
+  - name: link1
+    mode: direct_link

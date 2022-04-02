@@ -1,0 +1,41 @@
+[package]
+name = "rena"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nix = "0.23.1"
+anyhow = "1.0.53"
+tokio = { version = "1.15", features = ["full", "tracing"] }
+log = "0.4.14"
+env_logger = "0.9.0"
+regex = "1"
+structopt = "0.3"
+bytes = "1.1"
+rand = "0.8.5"
+futures = "0.3.21"
+
+[dev-dependencies]
+console-subscriber = "0.1.3"
+
+[[example]]
+name = "arping"
+path = "examples/arping.rs"
+
+[[example]]
+name = "pcap"
+path = "examples/pcap.rs"
+
+[[example]]
+name = "ping"
+path = "examples/ping.rs"
+
+[[example]]
+name = "tcp_local"
+path = "examples/tcp_local.rs"
+
+[[example]]
+name = "tcp_remote"
+path = "examples/tcp_remote.rs"
