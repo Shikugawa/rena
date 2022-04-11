@@ -212,8 +212,39 @@ impl TcpFrame {
         frame
     }
 
+    pub fn clone_tcp_only_header(&self) -> TcpFrame {
+        Self {
+            sport: self.sport,
+            dport: self.dport,
+            seq_num: self.seq_num,
+            ack_num: self.ack_num,
+            // We should fix this after we supported TCP options header.
+            offset: 5,
+            flags: 0x0000,
+            window_size: self.window_size,
+            cksum: 0,
+            urg_ptr: 0,
+            options: None,
+            sipaddr: self.sipaddr,
+            dipaddr: self.dipaddr,
+            payload: BytesMut::new(),
+        }
+    }
+
+    pub fn set_payload(&mut self, payload: BytesMut) {
+        self.payload = payload
+    }
+
+    pub fn window_size(&self) -> u16 {
+        self.window_size
+    }
+
     pub fn seq_num(&self) -> u32 {
         self.seq_num
+    }
+
+    pub fn set_seq_num(&mut self, num: u32) {
+        self.seq_num = num
     }
 
     pub fn ack_num(&self) -> u32 {

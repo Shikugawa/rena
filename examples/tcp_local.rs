@@ -12,6 +12,7 @@ use rena::frames::ethernet::EthernetFrame;
 use rena::packet::ArpPacket;
 use rena::tcp::local_handler::LocalHandler;
 use std::io;
+use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::time::Duration;
 
@@ -46,7 +47,7 @@ async fn main() {
     env_logger::init();
     let opt = Opt::from_args();
 
-    let sock = RawSock::new(&opt.interface).unwrap();
+    let sock = Arc::new(RawSock::new(&opt.interface).unwrap());
     let mut rand_gen = thread_rng();
     let src_ip_addr = sock.ipv4_addr;
     let dst_ip_addr = Ipv4Addr::from_str(&opt.dst_address).unwrap();
@@ -56,14 +57,14 @@ async fn main() {
     let dport = opt.port;
 
     let arp_req = create_arp_request(&sock, src_ip_addr, dst_ip_addr);
-    let res = write(&sock, arp_req, Duration::from_secs(3)).await;
+    let res = write(sock.clone(), arp_req, None).await;
     if res.is_err() {
         panic!("error")
     }
     let mut arp_table = ArpTable::new();
 
     // wait arp response
-    let mut buf = read(&sock, Duration::from_secs(3)).await.data().unwrap();
+    let mut buf = read(sock.clone(), None).await.data().unwrap();
     let ether = EthernetFrame::from_raw(&mut buf);
 
     // TODO: implement graceful connection draining.
@@ -95,7 +96,7 @@ async fn main() {
                         io::stdin().read_line(&mut buffer).unwrap();
 
                         if buffer == "close\n" {
-                            handler.close().await.unwrap();
+                            handler.close().await;
                             break;
                         } else {
                             let mut payload = BytesMut::with_capacity(buffer.len());

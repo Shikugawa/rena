@@ -1,8 +1,7 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
 use crate::buffer::Buffer;
-use crate::datalink::reader::DatalinkReader;
-use crate::datalink::writer::DatalinkWriter;
+use crate::datalink::traits::DatalinkReaderWriter;
 use crate::headers::iface::ifreq;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
@@ -30,17 +29,11 @@ pub struct TapDevice {
     ipaddr: Ipv4Addr,
 }
 
-impl DatalinkReader for TapDevice {
+impl DatalinkReaderWriter for TapDevice {
     fn read(&self, buf: &mut Buffer) -> isize {
         0
     }
 
-    fn async_fd(&self) -> &AsyncFd<i32> {
-        &self.fd
-    }
-}
-
-impl DatalinkWriter for TapDevice {
     fn write(&self, mut buf: BytesMut) -> isize {
         0
     }

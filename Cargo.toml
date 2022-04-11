@@ -37,5 +37,9 @@ name = "tcp_local"
 path = "examples/tcp_local.rs"
 
 [[example]]
+name = "tcp_local_large_body"
+path = "examples/tcp_local_large_body.rs"
+
+[[example]]
 name = "tcp_remote"
 path = "examples/tcp_remote.rs"

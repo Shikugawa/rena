@@ -1,22 +1,15 @@
+use crate::datalink::traits::DatalinkReaderWriter;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use core::fmt;
 use futures::future::poll_fn;
 use nix::libc::{self, EAGAIN};
+use std::sync::Arc;
 use std::{
     task::{Context, Poll},
     time::Duration,
 };
 use tokio::{io::unix::AsyncFd, time::Instant};
-
-// Abstractive writer object which enables to implement write operation with async support.
-pub trait DatalinkWriter: Sync + Send {
-    // Write buffer from datalink synchoronosly.
-    fn write(&self, buf: BytesMut) -> isize;
-
-    // Get abstractive non-blocking file descriptor to support async operation.
-    fn async_fd(&self) -> &AsyncFd<i32>;
-}
 
 #[derive(PartialEq)]
 pub enum WriteResult {
@@ -43,11 +36,19 @@ impl WriteResult {
 }
 
 /// Write buffer into datalink.
-pub async fn write(writer: &dyn DatalinkWriter, buf: BytesMut, duration: Duration) -> WriteResult {
-    let deadline = Instant::now() + duration;
+pub async fn write(
+    writer: Arc<dyn DatalinkReaderWriter>,
+    buf: BytesMut,
+    duration: Option<Duration>,
+) -> WriteResult {
+    let deadline = if duration.is_some() {
+        Some(Instant::now() + duration.unwrap())
+    } else {
+        None
+    };
 
     let future = poll_fn(|cx: &mut Context<'_>| -> Poll<WriteResult> {
-        if Instant::now() > deadline {
+        if deadline.is_some() && Instant::now() > deadline.unwrap() {
             return Poll::Ready(WriteResult::Timeout);
         }
         let code = writer.write(buf.to_owned());
