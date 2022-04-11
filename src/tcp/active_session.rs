@@ -81,6 +81,7 @@ impl ActiveSession {
             }
             _ => return Err(anyhow!("failed to create TCP frame")),
         }
+        self.on_send_tcp_frame(&frame);
 
         Ok(frame)
     }

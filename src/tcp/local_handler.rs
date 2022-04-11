@@ -80,7 +80,7 @@ impl LocalHandler {
         self.acknum_counter = HashMap::new();
 
         // Initial flight
-        while next_idx != self.session.send_buf_size() {
+        while next_idx != buf_size {
             self.send_data_internal(raw_packets[next_idx].0, raw_packets[next_idx].1.clone())
                 .await;
             next_idx += 1;
@@ -110,10 +110,15 @@ impl LocalHandler {
                             if tcp_frame.is_err() {
                                 continue;
                             }
+                            let tcp_frame = tcp_frame.unwrap();
 
-                            let recvd_ack_num = tcp_frame.unwrap().ack_num();
+                            let recvd_ack_num = tcp_frame.ack_num();
                             if !self.pending_buffer.contains_key(&recvd_ack_num) {
-                                continue
+                                continue;
+                            }
+
+                            if !self.session.on_recv_tcp_frame(&tcp_frame) {
+                                continue;
                             }
 
                             self.pending_buffer.remove(&recvd_ack_num);
@@ -136,6 +141,7 @@ impl LocalHandler {
         }
 
         self.pending_buffer.clear();
+        self.acknum_counter.clear();
         Ok(())
     }
 
