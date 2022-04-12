@@ -14,7 +14,6 @@ use rena::tcp::local_handler::LocalHandler;
 use std::io;
 use std::sync::Arc;
 use structopt::StructOpt;
-use tokio::time::Duration;
 
 #[derive(StructOpt)]
 #[structopt(name = "basic")]
@@ -99,11 +98,12 @@ async fn main() {
                             handler.close().await;
                             break;
                         } else {
+                            buffer = buffer.strip_suffix("\n").unwrap().to_string();
                             let n: usize = buffer.parse().unwrap();
                             let mut payload = BytesMut::with_capacity(n);
 
                             for _ in 0..n {
-                                payload.put_slice(&[0x01]);
+                                payload.put_slice(&[b'a']);
                             }
                             handler.send(payload).await.unwrap();
                         }

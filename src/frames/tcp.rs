@@ -212,10 +212,6 @@ impl TcpFrame {
         frame
     }
 
-    pub fn set_payload(&mut self, payload: BytesMut) {
-        self.payload = payload
-    }
-
     pub fn window_size(&self) -> u16 {
         self.window_size
     }

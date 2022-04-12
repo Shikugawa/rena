@@ -15,7 +15,7 @@ use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use log::{info, warn};
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::time::{interval, Duration, Instant};
 
@@ -27,14 +27,10 @@ pub struct LocalHandler {
     session: ActiveSession,
     sock: Arc<dyn DatalinkReaderWriter>,
 
-    // pending_buffer is used to hold inflight segments.
+    // pending_message_queue is used to hold inflight segments.
     // If retransmission which is triggered by 1) duplicated ack_num, 2) ack timeout
     // is occurred, the number of packet will be enqueued repeatedly here.
-    pending_buffer: HashMap<u32, Instant>,
-
-    // acknum_counter is used to accumulate local-side segment retransmission,
-    // which is exepcted to be used after the count is larger than 4.
-    acknum_counter: HashMap<u32, usize>,
+    pending_message_queue: VecDeque<(usize, Instant)>,
 }
 
 impl LocalHandler {
@@ -55,8 +51,7 @@ impl LocalHandler {
             dipaddr,
             session,
             sock: sock,
-            pending_buffer: HashMap::new(),
-            acknum_counter: HashMap::new(),
+            pending_message_queue: VecDeque::new(),
         };
         local_handler.handshake().await;
         Ok(local_handler)
@@ -64,43 +59,45 @@ impl LocalHandler {
 
     pub async fn send(&mut self, payload: BytesMut) -> Result<()> {
         let raw_packets = self.create_tcp_data_packet(payload);
-        let mut acknum_idx_table: HashMap<u32, usize> = HashMap::new();
-
-        // Construct reverse loopup table expected_ack_num -> idx
-        for (i, entry) in raw_packets.iter().enumerate() {
-            let ack_num = entry.0.clone();
-            acknum_idx_table.insert(ack_num, i);
-        }
 
         let mut next_idx = 0;
-        let buf_size = min(self.session.send_buf_size(), raw_packets.len());
+        let pending_buf_size = min(self.session.send_buf_size(), raw_packets.len());
 
         // Init data send state
-        self.pending_buffer = HashMap::with_capacity(buf_size);
-        self.acknum_counter = HashMap::new();
+        self.pending_message_queue = VecDeque::with_capacity(pending_buf_size);
 
         // Initial flight
-        while next_idx != buf_size {
-            self.send_data_internal(raw_packets[next_idx].0, raw_packets[next_idx].1.clone())
+        let start_idx = next_idx;
+        while next_idx < start_idx + pending_buf_size {
+            self.send_data_internal(next_idx, raw_packets[next_idx].1.clone())
                 .await;
             next_idx += 1;
         }
 
         let mut interval = interval(Duration::from_secs(1));
 
-        // Wait responses and handle retransmission
+        // Wait ACKs for pending messages. If it succeeded, it executes
+        // 1) If it has remaining segment, handler sends it.
+        // 2) If ACKs can't be received via timeout, handler execute transmission
+        //    for failed SYN message immediately.
         while next_idx < raw_packets.len() {
             tokio::select! {
-                mut instant = interval.tick() => {
-                    for (ack_num, deadline) in self.pending_buffer.iter_mut() {
-                        if deadline > &mut instant {
-                            let packet = raw_packets[acknum_idx_table[ack_num]].1.clone();
+                instant = interval.tick() => {
+                    while !self.pending_message_queue.is_empty() {
+                        let (_, deadline) = self.pending_message_queue.front().unwrap();
 
-                            write(self.sock.clone(), packet, None).await;
-                            // TODO: fix backoff timeout
-                            let new_deadline = Instant::now() + Duration::from_secs(3);
-                            *deadline = new_deadline;
+                        if deadline <= &instant {
+                            break;
                         }
+
+                        let (idx, _) = self.pending_message_queue.pop_front().unwrap();
+                        let packet = raw_packets[idx].1.clone();
+
+                        write(self.sock.clone(), packet, None).await;
+
+                        // TODO: fix backoff timeout
+                        let new_deadline = Instant::now() + Duration::from_secs(3);
+                        self.pending_message_queue.push_back((idx, new_deadline));
                     }
                 },
                 res = read(self.sock.clone(), None) => {
@@ -110,38 +107,29 @@ impl LocalHandler {
                             if tcp_frame.is_err() {
                                 continue;
                             }
-                            let tcp_frame = tcp_frame.unwrap();
 
-                            let recvd_ack_num = tcp_frame.ack_num();
-                            if !self.pending_buffer.contains_key(&recvd_ack_num) {
-                                continue;
-                            }
+                            let tcp_frame = tcp_frame.unwrap();
+                            self.pending_message_queue.pop_front().unwrap();
 
                             if !self.session.on_recv_tcp_frame(&tcp_frame) {
                                 continue;
                             }
 
-                            self.pending_buffer.remove(&recvd_ack_num);
                             next_idx += 1;
 
-                            self.send_data_internal(raw_packets[next_idx].0, raw_packets[next_idx].1.clone()).await;
-
-                            // Manipulate acknum counter and prepare for retransmission
-                            self.inc_acknum_counter(recvd_ack_num);
-                            if self.should_retransmit(recvd_ack_num) {
-                                unimplemented!()
+                            if next_idx >= raw_packets.len() {
+                                break;
                             }
+
+                            self.send_data_internal(next_idx, raw_packets[next_idx].1.clone()).await;
                         }
-                        ReadResult::Timeout => {
-                            unimplemented!()
-                        }
+                        ReadResult::Timeout => {}
                     }
                 }
             }
         }
 
-        self.pending_buffer.clear();
-        self.acknum_counter.clear();
+        self.pending_message_queue.clear();
         Ok(())
     }
 
@@ -172,26 +160,12 @@ impl LocalHandler {
         self.send_internal(packet, None).await;
     }
 
-    async fn send_data_internal(&mut self, acknum_expected: u32, packet: BytesMut) {
+    // TODO: handle timeout if local transmission failed
+    async fn send_data_internal(&mut self, idx: usize, packet: BytesMut) {
         write(self.sock.clone(), packet, None).await;
         // TODO: fix backoff timeout
         let deadline = Instant::now() + Duration::from_secs(3);
-        self.pending_buffer.insert(acknum_expected, deadline);
-    }
-
-    fn inc_acknum_counter(&mut self, ack_num: u32) {
-        if !self.acknum_counter.contains_key(&ack_num) {
-            self.acknum_counter.insert(ack_num, 0);
-        }
-        let next_val = self.acknum_counter.get(&ack_num).unwrap() + 1;
-        self.acknum_counter.insert(ack_num, next_val);
-    }
-
-    fn should_retransmit(&self, ack_num: u32) -> bool {
-        if !self.acknum_counter.contains_key(&ack_num) {
-            return false;
-        }
-        self.acknum_counter[&ack_num] >= 4
+        self.pending_message_queue.push_back((idx, deadline));
     }
 
     // Retransmit after timeout expired
@@ -210,6 +184,9 @@ impl LocalHandler {
     }
 
     async fn recv_packet(&mut self, timeout: Option<Duration>) -> ReadResult {
+        // TODO: current implementation is not enough because it may occur massive packet copies
+        // if user has many handlers. We should create receive handler which transports received message
+        // to the destination handler.
         loop {
             let res = read(self.sock.clone(), timeout).await;
             match res {

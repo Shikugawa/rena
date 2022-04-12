@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use log::info;
 use rand::{thread_rng, Rng};
+use std::collections::{HashMap, HashSet};
 
 // TODO: follow spec
 fn isn_gen() -> u32 {
@@ -25,6 +26,11 @@ pub struct ActiveSession {
     sent_bytes: u32,
     window_size: u16,
     mss: u16,
+    waiting_acks: HashSet<u32>,
+
+    // acknum_counter is used to accumulate local-side segment retransmission,
+    // which is exepcted to be used after the count is larger than 4.
+    acknum_counter: HashMap<u32, usize>,
 }
 
 impl ActiveSession {
@@ -42,6 +48,8 @@ impl ActiveSession {
             sent_bytes: 0,
             window_size: 1000,
             mss: 1460,
+            waiting_acks: HashSet::new(),
+            acknum_counter: HashMap::new(),
         }
     }
 
@@ -81,6 +89,10 @@ impl ActiveSession {
             }
             _ => return Err(anyhow!("failed to create TCP frame")),
         }
+
+        let waiting_ack = frame.seq_num() + 1;
+        self.waiting_acks.insert(waiting_ack);
+
         self.on_send_tcp_frame(&frame);
 
         Ok(frame)
@@ -90,21 +102,7 @@ impl ActiveSession {
         if self.state != State::Established {
             return Err(anyhow!("session state must be ESTABLISHED"));
         }
-        if (self.window_size as usize) < payload.len() {
-            return Err(anyhow!(
-                "payload size {} is exceeded window size {}",
-                payload.len(),
-                self.window_size
-            ));
-        }
-        let payload_chunk_num = {
-            let mut tmp = self.window_size / self.mss;
-            if self.window_size % self.mss != 0 {
-                tmp += 1;
-            }
-            tmp
-        };
-        let chunked_payloads = payload.chunks(payload_chunk_num as usize);
+        let chunked_payloads = payload.chunks(self.mss as usize);
         let mut frames = Vec::new();
 
         for chunk in chunked_payloads {
@@ -119,7 +117,11 @@ impl ActiveSession {
                 BytesMut::from(chunk),
             );
             frame.set_ack();
+
+            let waiting_ack = frame.seq_num() + (frame.payload_length() as u32);
+            self.waiting_acks.insert(waiting_ack);
             self.on_send_tcp_frame(&frame);
+
             frames.push(frame);
         }
 
@@ -127,10 +129,16 @@ impl ActiveSession {
     }
 
     pub fn on_recv_tcp_frame(&mut self, frame: &TcpFrame) -> bool {
-        // If received frame is not belonging to this stream. Session disposes it.
-        if !self.is_recv_frame_in_this_session(frame) {
+        let ack_num = frame.ack_num();
+        println!("- {}", ack_num);
+        for v in &self.waiting_acks {
+            println!("{}", v);
+        }
+        if !self.waiting_acks.contains(&ack_num) {
             return false;
         }
+        self.waiting_acks.remove(&ack_num);
+        self.inc_acknum_counter(&ack_num);
 
         let mut valid = true;
         match self.state {
@@ -139,7 +147,7 @@ impl ActiveSession {
                     self.update_state(State::Closed);
                 } else if frame.is_ack() && frame.is_syn() {
                     self.update_next_ack_num(frame.seq_num() + 1);
-                    self.update_window_size(frame.window_size())
+                    self.update_window_size(frame.window_size());
                 } else {
                     valid = false;
                 }
@@ -173,17 +181,20 @@ impl ActiveSession {
         self.init_seq_num
     }
 
-    pub fn is_recv_frame_in_this_session(&self, frame: &TcpFrame) -> bool {
-        // we treat ISN as the stream identification. Expecting no collision of it.
-        (frame.ack_num() - self.sent_bytes) == self.init_seq_num
-    }
-
     pub fn state(&self) -> State {
         self.state
     }
 
     pub fn send_buf_size(&self) -> usize {
         (self.window_size / self.mss) as usize
+    }
+
+    fn inc_acknum_counter(&mut self, ack_num: &u32) {
+        if !self.acknum_counter.contains_key(&ack_num) {
+            self.acknum_counter.insert(*ack_num, 0);
+        }
+        let next_val = self.acknum_counter.get(&ack_num).unwrap() + 1;
+        self.acknum_counter.insert(*ack_num, next_val);
     }
 
     fn on_send_tcp_frame(&mut self, frame: &TcpFrame) {
@@ -260,6 +271,7 @@ impl ActiveSession {
 
 impl Drop for ActiveSession {
     fn drop(&mut self) {
+        // TODO: send drop packet in close
         self.update_state(State::Closed);
     }
 }
