@@ -61,7 +61,7 @@ impl LocalHandler {
         let raw_packets = self.create_tcp_data_packet(payload);
 
         let mut next_idx = 0;
-        let pending_buf_size = min(self.session.send_buf_size(), raw_packets.len());
+        let pending_buf_size = min(self.session.can_send_packet_num(), raw_packets.len());
 
         // Init data send state
         self.pending_message_queue = VecDeque::with_capacity(pending_buf_size);

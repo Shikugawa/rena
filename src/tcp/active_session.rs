@@ -130,13 +130,10 @@ impl ActiveSession {
 
     pub fn on_recv_tcp_frame(&mut self, frame: &TcpFrame) -> bool {
         let ack_num = frame.ack_num();
-        println!("- {}", ack_num);
-        for v in &self.waiting_acks {
-            println!("{}", v);
-        }
         if !self.waiting_acks.contains(&ack_num) {
             return false;
         }
+
         self.waiting_acks.remove(&ack_num);
         self.inc_acknum_counter(&ack_num);
 
@@ -185,7 +182,7 @@ impl ActiveSession {
         self.state
     }
 
-    pub fn send_buf_size(&self) -> usize {
+    pub fn can_send_packet_num(&self) -> usize {
         (self.window_size / self.mss) as usize
     }
 
