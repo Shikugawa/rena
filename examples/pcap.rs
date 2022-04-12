@@ -3,6 +3,7 @@ use rena::datalink::reader::read;
 use rena::frames::ethernet::EtherType;
 use rena::frames::ethernet::EthernetFrame;
 use rena::frames::ipv4::IpProtocol;
+use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::Duration;
@@ -20,7 +21,7 @@ async fn main() {
     env_logger::init();
     let opt = Opt::from_args();
 
-    let sock = RawSock::new(&opt.interface).unwrap();
+    let sock = Arc::new(RawSock::new(&opt.interface).unwrap());
     let mut stream = signal(SignalKind::interrupt()).unwrap();
 
     let mut packet_no = 1;
@@ -31,7 +32,7 @@ async fn main() {
                 // in async runtime.
                 return;
             },
-            buf = read(&sock, Duration::from_secs(3)) => {
+            buf = read(sock.clone(), None) => {
                 println!("Packet ID: {}\n", packet_no);
                 packet_no += 1;
                 let mut buf2 = buf.data().unwrap();

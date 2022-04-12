@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use log::info;
 use rand::{thread_rng, Rng};
+use std::collections::{HashMap, HashSet};
 
 // TODO: follow spec
 fn isn_gen() -> u32 {
@@ -24,6 +25,12 @@ pub struct ActiveSession {
     init_seq_num: u32,
     sent_bytes: u32,
     window_size: u16,
+    mss: u16,
+    waiting_acks: HashSet<u32>,
+
+    // acknum_counter is used to accumulate local-side segment retransmission,
+    // which is exepcted to be used after the count is larger than 4.
+    acknum_counter: HashMap<u32, usize>,
 }
 
 impl ActiveSession {
@@ -39,7 +46,10 @@ impl ActiveSession {
             next_ack_num: 0,
             init_seq_num: isn,
             sent_bytes: 0,
-            window_size: 1000, // Is the initial window size correct?
+            window_size: 1000,
+            mss: 1460,
+            waiting_acks: HashSet::new(),
+            acknum_counter: HashMap::new(),
         }
     }
 
@@ -80,28 +90,111 @@ impl ActiveSession {
             _ => return Err(anyhow!("failed to create TCP frame")),
         }
 
+        let waiting_ack = frame.seq_num() + 1;
+        self.waiting_acks.insert(waiting_ack);
+
+        self.on_send_tcp_frame(&frame);
+
         Ok(frame)
     }
 
-    pub fn create_next_data_frame(&mut self, payload: BytesMut) -> Result<TcpFrame> {
+    pub fn create_next_data_frame(&mut self, payload: BytesMut) -> Result<Vec<TcpFrame>> {
         if self.state != State::Established {
             return Err(anyhow!("session state must be ESTABLISHED"));
         }
-        let mut frame = TcpFrame::new(
-            self.sipaddr,
-            self.dipaddr,
-            self.sport,
-            self.dport,
-            self.next_seq_num,
-            self.next_ack_num,
-            self.window_size,
-            payload,
-        );
-        frame.set_ack();
-        Ok(frame)
+        let chunked_payloads = payload.chunks(self.mss as usize);
+        let mut frames = Vec::new();
+
+        for chunk in chunked_payloads {
+            let mut frame = TcpFrame::new(
+                self.sipaddr,
+                self.dipaddr,
+                self.sport,
+                self.dport,
+                self.next_seq_num,
+                self.next_ack_num,
+                self.window_size,
+                BytesMut::from(chunk),
+            );
+            frame.set_ack();
+
+            let waiting_ack = frame.seq_num() + (frame.payload_length() as u32);
+            self.waiting_acks.insert(waiting_ack);
+            self.on_send_tcp_frame(&frame);
+
+            frames.push(frame);
+        }
+
+        Ok(frames)
     }
 
-    pub fn on_send_tcp_frame(&mut self, frame: &TcpFrame) {
+    pub fn on_recv_tcp_frame(&mut self, frame: &TcpFrame) -> bool {
+        let ack_num = frame.ack_num();
+        if !self.waiting_acks.contains(&ack_num) {
+            return false;
+        }
+
+        self.waiting_acks.remove(&ack_num);
+        self.inc_acknum_counter(&ack_num);
+
+        let mut valid = true;
+        match self.state {
+            State::SynSent => {
+                if frame.is_rst() {
+                    self.update_state(State::Closed);
+                } else if frame.is_ack() && frame.is_syn() {
+                    self.update_next_ack_num(frame.seq_num() + 1);
+                    self.update_window_size(frame.window_size());
+                } else {
+                    valid = false;
+                }
+            }
+            State::Established => {
+                if frame.is_fin() && frame.is_ack() {
+                    self.update_state(State::CloseWait);
+                } else if frame.is_ack() {
+                    self.update_next_ack_num(frame.seq_num() + frame.payload_length() as u32);
+                    self.update_window_size(frame.window_size())
+                } else {
+                    valid = false;
+                }
+            }
+            State::FinWait1 => {
+                if frame.is_fin() && frame.is_ack() {
+                    self.update_state(State::FinWait2);
+                    self.update_next_ack_num(frame.seq_num() + 1);
+                } else {
+                    valid = false;
+                }
+            }
+            _ => valid = false,
+        };
+
+        valid
+    }
+
+    pub fn stream_id(&self) -> u32 {
+        // we treat ISN as the stream identification. Expecting no collision of it.
+        self.init_seq_num
+    }
+
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    pub fn can_send_packet_num(&self) -> usize {
+        (self.window_size / self.mss) as usize
+    }
+
+    fn inc_acknum_counter(&mut self, ack_num: &u32) {
+        if !self.acknum_counter.contains_key(&ack_num) {
+            self.acknum_counter.insert(*ack_num, 0);
+        }
+        let next_val = self.acknum_counter.get(&ack_num).unwrap() + 1;
+        self.acknum_counter.insert(*ack_num, next_val);
+    }
+
+    fn on_send_tcp_frame(&mut self, frame: &TcpFrame) {
         match self.state {
             State::Closed => {
                 self.update_state(State::SynSent);
@@ -138,60 +231,6 @@ impl ActiveSession {
         }
     }
 
-    pub fn on_recv_tcp_frame(&mut self, frame: &TcpFrame) -> bool {
-        // If received frame is not belonging to this stream. Session disposes it.
-        if !self.is_recv_frame_in_this_session(frame) {
-            return false;
-        }
-
-        let mut valid = true;
-        match self.state {
-            State::SynSent => {
-                if frame.is_rst() {
-                    self.update_state(State::Closed);
-                } else if frame.is_ack() && frame.is_syn() {
-                    self.update_next_ack_num(frame.seq_num() + 1);
-                } else {
-                    valid = false;
-                }
-            }
-            State::Established => {
-                if frame.is_fin() && frame.is_ack() {
-                    self.update_state(State::CloseWait);
-                } else if frame.is_ack() {
-                    self.update_next_ack_num(frame.seq_num() + frame.payload_length() as u32);
-                } else {
-                    valid = false;
-                }
-            }
-            State::FinWait1 => {
-                if frame.is_fin() && frame.is_ack() {
-                    self.update_state(State::FinWait2);
-                    self.update_next_ack_num(frame.seq_num() + 1);
-                } else {
-                    valid = false;
-                }
-            }
-            _ => valid = false,
-        };
-
-        valid
-    }
-
-    pub fn stream_id(&self) -> u32 {
-        // we treat ISN as the stream identification. Expecting no collision of it.
-        self.init_seq_num
-    }
-
-    pub fn is_recv_frame_in_this_session(&self, frame: &TcpFrame) -> bool {
-        // we treat ISN as the stream identification. Expecting no collision of it.
-        (frame.ack_num() - self.sent_bytes) == self.init_seq_num
-    }
-
-    pub fn state(&self) -> State {
-        self.state
-    }
-
     fn update_state(&mut self, next_state: State) {
         let prev_state = self.state;
         self.state = next_state;
@@ -219,10 +258,17 @@ impl ActiveSession {
         self.sent_bytes += num;
         info!("sent bytes updated {} -> {}", tmp, self.sent_bytes);
     }
+
+    fn update_window_size(&mut self, num: u16) {
+        let tmp = self.window_size;
+        self.window_size = num;
+        info!("window size updated {} -> {}", tmp, self.window_size);
+    }
 }
 
 impl Drop for ActiveSession {
     fn drop(&mut self) {
+        // TODO: send drop packet in close
         self.update_state(State::Closed);
     }
 }

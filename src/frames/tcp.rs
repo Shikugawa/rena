@@ -212,6 +212,10 @@ impl TcpFrame {
         frame
     }
 
+    pub fn window_size(&self) -> u16 {
+        self.window_size
+    }
+
     pub fn seq_num(&self) -> u32 {
         self.seq_num
     }

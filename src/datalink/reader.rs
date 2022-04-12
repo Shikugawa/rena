@@ -1,20 +1,13 @@
 use crate::buffer::Buffer;
+use crate::datalink::traits::DatalinkReaderWriter;
 use anyhow::{anyhow, Result};
 use futures::future::poll_fn;
 use nix::libc::{self, EAGAIN};
 use std::fmt;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{Duration, Instant};
-
-// Abstractive reader object which enables to implement read operation with async support.
-pub trait DatalinkReader: Sync + Send {
-    // Read buffer from datalink synchoronosly.
-    fn read(&self, buf: &mut Buffer) -> isize;
-
-    // Get abstractive non-blocking file descriptor to support async operation.
-    fn async_fd(&self) -> &AsyncFd<i32>;
-}
 
 #[derive(PartialEq)]
 pub enum ReadResult {
@@ -48,12 +41,16 @@ impl ReadResult {
 }
 
 /// Read buffer from datalink
-pub async fn read(reader: &dyn DatalinkReader, duration: Duration) -> ReadResult {
+pub async fn read(reader: Arc<dyn DatalinkReaderWriter>, duration: Option<Duration>) -> ReadResult {
     let mut buf = Buffer::default();
-    let deadline = Instant::now() + duration;
+    let deadline = if duration.is_some() {
+        Some(Instant::now() + duration.unwrap())
+    } else {
+        None
+    };
 
     let future = poll_fn(|cx: &mut Context<'_>| -> Poll<ReadResult> {
-        if Instant::now() > deadline {
+        if deadline.is_some() && Instant::now() > deadline.unwrap() {
             return Poll::Ready(ReadResult::Timeout);
         }
         let code = reader.read(&mut buf);

@@ -1,8 +1,7 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
 use crate::buffer::{Buffer, MAX_BUFFER_SIZE};
-use crate::datalink::reader::DatalinkReader;
-use crate::datalink::writer::DatalinkWriter;
+use crate::datalink::traits::DatalinkReaderWriter;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use nix::ifaddrs::getifaddrs;
@@ -25,7 +24,7 @@ pub struct RawSock {
     link_addr: Option<LinkAddr>,
 }
 
-impl DatalinkReader for RawSock {
+impl DatalinkReaderWriter for RawSock {
     fn read(&self, buf: &mut Buffer) -> isize {
         unsafe {
             libc::read(
@@ -36,12 +35,6 @@ impl DatalinkReader for RawSock {
         }
     }
 
-    fn async_fd(&self) -> &AsyncFd<i32> {
-        &self.fd
-    }
-}
-
-impl DatalinkWriter for RawSock {
     fn write(&self, mut buf: BytesMut) -> isize {
         let link = SockAddr::Link(self.link_addr.unwrap());
         let (ffi_addr, _) = link.as_ffi_pair();

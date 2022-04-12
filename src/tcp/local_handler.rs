@@ -3,8 +3,10 @@ use crate::addresses::mac::MacAddr;
 use crate::buffer::Buffer;
 use crate::datalink::rawsock::RawSock;
 use crate::datalink::reader::{read, ReadResult};
+use crate::datalink::traits::DatalinkReaderWriter;
 use crate::datalink::writer::{write, WriteResult};
 use crate::frames::ethernet::{EtherType, EthernetFrame};
+use crate::frames::frame::Frame;
 use crate::frames::ipv4::IpProtocol;
 use crate::frames::tcp::TcpFrame;
 use crate::packet::TcpPacket;
@@ -12,9 +14,10 @@ use crate::tcp::active_session::ActiveSession;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use log::{info, warn};
-use tokio::time::{Duration, Instant};
-
-const ACK_TIMEOUT_SEC: u64 = 3;
+use std::cmp::min;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use tokio::time::{interval, Duration, Instant};
 
 pub struct LocalHandler {
     smacaddr: MacAddr,
@@ -22,7 +25,12 @@ pub struct LocalHandler {
     sipaddr: Ipv4Addr,
     dipaddr: Ipv4Addr,
     session: ActiveSession,
-    sock: RawSock,
+    sock: Arc<dyn DatalinkReaderWriter>,
+
+    // pending_message_queue is used to hold inflight segments.
+    // If retransmission which is triggered by 1) duplicated ack_num, 2) ack timeout
+    // is occurred, the number of packet will be enqueued repeatedly here.
+    pending_message_queue: VecDeque<(usize, Instant)>,
 }
 
 impl LocalHandler {
@@ -33,7 +41,7 @@ impl LocalHandler {
         dipaddr: Ipv4Addr,
         sport: u16,
         dport: u16,
-        sock: RawSock,
+        sock: Arc<RawSock>,
     ) -> Result<Self> {
         let session = ActiveSession::new(sipaddr, dipaddr, sport, dport);
         let mut local_handler = LocalHandler {
@@ -42,126 +50,154 @@ impl LocalHandler {
             sipaddr,
             dipaddr,
             session,
-            sock,
+            sock: sock,
+            pending_message_queue: VecDeque::new(),
         };
-        if let Err(err) = local_handler.handshake().await {
-            return Err(anyhow!("handshake failed: {}", err));
-        }
+        local_handler.handshake().await;
         Ok(local_handler)
     }
 
     pub async fn send(&mut self, payload: BytesMut) -> Result<()> {
-        let packet = self.create_tcp_data_packet(payload);
-        self.send_internal(packet).await
-    }
+        let raw_packets = self.create_tcp_data_packet(payload);
 
-    async fn send_internal(&mut self, packet: (BytesMut, TcpFrame)) -> Result<()> {
-        loop {
-            let packet_c = packet.0.clone();
-            let tcp_frame_c = packet.1.clone();
-            let res = self.send_packet((packet_c, tcp_frame_c)).await;
-            if res == WriteResult::Timeout {
-                warn!("write timeout, retransmission");
-                continue;
-            }
-            // ack receive
-            let res = self.recv_packet().await;
-            if res == ReadResult::Timeout {
-                warn!("read timeout, retransmission");
-                continue;
-            }
-            break;
+        let mut next_idx = 0;
+        let pending_buf_size = min(self.session.can_send_packet_num(), raw_packets.len());
+
+        // Init data send state
+        self.pending_message_queue = VecDeque::with_capacity(pending_buf_size);
+
+        // Initial flight
+        let start_idx = next_idx;
+        while next_idx < start_idx + pending_buf_size {
+            self.send_data_internal(next_idx, raw_packets[next_idx].1.clone())
+                .await;
+            next_idx += 1;
         }
+
+        let mut interval = interval(Duration::from_secs(1));
+
+        // Wait ACKs for pending messages. If it succeeded, it executes
+        // 1) If it has remaining segment, handler sends it.
+        // 2) If ACKs can't be received via timeout, handler execute transmission
+        //    for failed SYN message immediately.
+        while next_idx < raw_packets.len() {
+            tokio::select! {
+                instant = interval.tick() => {
+                    while !self.pending_message_queue.is_empty() {
+                        let (_, deadline) = self.pending_message_queue.front().unwrap();
+
+                        if deadline <= &instant {
+                            break;
+                        }
+
+                        let (idx, _) = self.pending_message_queue.pop_front().unwrap();
+                        let packet = raw_packets[idx].1.clone();
+
+                        write(self.sock.clone(), packet, None).await;
+
+                        // TODO: fix backoff timeout
+                        let new_deadline = Instant::now() + Duration::from_secs(3);
+                        self.pending_message_queue.push_back((idx, new_deadline));
+                    }
+                },
+                res = read(self.sock.clone(), None) => {
+                    match res {
+                        ReadResult::Success(buf) => {
+                            let tcp_frame = parse_tcp_packet(buf);
+                            if tcp_frame.is_err() {
+                                continue;
+                            }
+
+                            let tcp_frame = tcp_frame.unwrap();
+                            self.pending_message_queue.pop_front().unwrap();
+
+                            if !self.session.on_recv_tcp_frame(&tcp_frame) {
+                                continue;
+                            }
+
+                            next_idx += 1;
+
+                            if next_idx >= raw_packets.len() {
+                                break;
+                            }
+
+                            self.send_data_internal(next_idx, raw_packets[next_idx].1.clone()).await;
+                        }
+                        ReadResult::Timeout => {}
+                    }
+                }
+            }
+        }
+
+        self.pending_message_queue.clear();
         Ok(())
     }
 
-    pub async fn close(&mut self) -> Result<()> {
+    pub async fn close(&mut self) {
         // start close handshake
         let stream_id = self.session.stream_id();
         info!("session {} close handshake", stream_id);
 
         let packet = self.create_tcp_packet(true);
-        let res = self.send_packet(packet).await;
-        // TODO: execute retransmission
-        match res {
-            WriteResult::Timeout => return Err(anyhow!("write timeout")),
-            _ => {}
-        }
+        self.send_internal(packet, None).await;
 
-        let res = self.recv_packet().await;
-        // TODO: execute retransmission
-        match res {
-            ReadResult::Timeout => return Err(anyhow!("read timeout")),
-            _ => {}
-        }
+        self.recv_packet(None).await;
 
         let packet = self.create_tcp_packet(false);
-        let res = self.send_packet(packet).await;
-        match res {
-            WriteResult::Timeout => return Err(anyhow!("write timeout")),
-            _ => {}
-        }
-        Ok(())
+        self.send_internal(packet, None).await;
     }
 
-    async fn handshake(&mut self) -> Result<()> {
+    async fn handshake(&mut self) {
         let stream_id = self.session.stream_id();
         info!("session {} start handshake", stream_id);
 
         let packet = self.create_tcp_packet(false);
-        let res = self.send_packet(packet).await;
-        // TODO: execute retransmission
-        match res {
-            WriteResult::Timeout => return Err(anyhow!("write timeout")),
-            _ => {}
-        }
+        self.send_internal(packet, None).await;
 
-        let res = self.recv_packet().await;
-        // TODO: execute retransmission
-        match res {
-            ReadResult::Timeout => return Err(anyhow!("read timeout")),
-            _ => {}
-        }
+        self.recv_packet(None).await;
 
         let packet = self.create_tcp_packet(false);
-        let res = self.send_packet(packet).await;
-        match res {
-            WriteResult::Timeout => return Err(anyhow!("write timeout")),
-            _ => {}
-        }
-        Ok(())
+        self.send_internal(packet, None).await;
     }
 
-    async fn send_packet(&mut self, (tcp_packet, tcp_frame): (BytesMut, TcpFrame)) -> WriteResult {
-        let res = write(&self.sock, tcp_packet, Duration::from_secs(ACK_TIMEOUT_SEC)).await;
-        match res {
-            WriteResult::Success(_) => self.session.on_send_tcp_frame(&tcp_frame),
-            _ => {}
-        }
-        res
+    // TODO: handle timeout if local transmission failed
+    async fn send_data_internal(&mut self, idx: usize, packet: BytesMut) {
+        write(self.sock.clone(), packet, None).await;
+        // TODO: fix backoff timeout
+        let deadline = Instant::now() + Duration::from_secs(3);
+        self.pending_message_queue.push_back((idx, deadline));
     }
 
-    async fn recv_packet(&mut self) -> ReadResult {
-        let deadline = Instant::now() + Duration::from_secs(ACK_TIMEOUT_SEC);
+    // Retransmit after timeout expired
+    async fn send_internal(
+        &mut self,
+        tcp_packet: BytesMut,
+        timeout: Option<Duration>,
+    ) -> WriteResult {
         loop {
-            if deadline < Instant::now() {
-                return ReadResult::Timeout;
+            let res = write(self.sock.clone(), tcp_packet.clone(), timeout).await;
+            if res == WriteResult::Timeout {
+                continue;
             }
-            let next_duration = deadline - Instant::now();
-            let res = read(&self.sock, next_duration).await;
+            return res;
+        }
+    }
+
+    async fn recv_packet(&mut self, timeout: Option<Duration>) -> ReadResult {
+        // TODO: current implementation is not enough because it may occur massive packet copies
+        // if user has many handlers. We should create receive handler which transports received message
+        // to the destination handler.
+        loop {
+            let res = read(self.sock.clone(), timeout).await;
             match res {
                 ReadResult::Success(buf) => {
-                    let res2 = parse_tcp_packet(buf);
-                    if res2.is_err() {
+                    let tcp_frame = parse_tcp_packet(buf);
+                    if tcp_frame.is_err() {
                         continue;
                     }
-                    let tcp_frame = res2.unwrap();
-                    if !self.session.is_recv_frame_in_this_session(&tcp_frame)
-                        || !self.session.on_recv_tcp_frame(&tcp_frame)
-                    {
+                    if !self.session.on_recv_tcp_frame(&tcp_frame.unwrap()) {
                         continue;
                     }
-
                     return res;
                 }
                 ReadResult::Timeout => {
@@ -171,24 +207,35 @@ impl LocalHandler {
         }
     }
 
-    fn create_tcp_packet(&mut self, close: bool) -> (BytesMut, TcpFrame) {
+    fn create_tcp_packet(&mut self, close: bool) -> BytesMut {
         let tcp_frame = self.session.create_next_frame(close).unwrap();
         let packet = TcpPacket::default()
             .set_tcp(tcp_frame.clone())
             .set_ipv4(self.sipaddr, self.dipaddr)
             .set_ether(self.smacaddr, self.dmacaddr)
             .build();
-        (packet, tcp_frame)
+        packet
     }
 
-    fn create_tcp_data_packet(&mut self, payload: BytesMut) -> (BytesMut, TcpFrame) {
-        let tcp_frame = self.session.create_next_data_frame(payload).unwrap();
-        let packet = TcpPacket::default()
-            .set_tcp(tcp_frame.clone())
-            .set_ipv4(self.sipaddr, self.dipaddr)
-            .set_ether(self.smacaddr, self.dmacaddr)
-            .build();
-        (packet, tcp_frame)
+    fn create_tcp_data_packet(
+        &mut self,
+        payload: BytesMut,
+    ) -> Vec<(u32 /* exepcted ack num */, BytesMut)> {
+        let tcp_frames = self.session.create_next_data_frame(payload).unwrap();
+        let mut chunked_raw_frames = Vec::new();
+
+        for frame in tcp_frames {
+            let tcp_seq_num = frame.seq_num();
+            let tcp_payload_len = frame.payload_length();
+            let raw_packet = TcpPacket::default()
+                .set_tcp(frame)
+                .set_ipv4(self.sipaddr, self.dipaddr)
+                .set_ether(self.smacaddr, self.dmacaddr)
+                .build();
+            chunked_raw_frames.push((tcp_seq_num + tcp_payload_len as u32, raw_packet));
+        }
+
+        chunked_raw_frames
     }
 }
 

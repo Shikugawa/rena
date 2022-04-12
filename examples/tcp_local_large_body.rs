@@ -1,4 +1,5 @@
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
+use rand::{thread_rng, Rng};
 use rena::addresses::ipv4::Ipv4Addr;
 use rena::addresses::mac::MacAddr;
 use rena::arp_table::ArpTable;
@@ -8,11 +9,11 @@ use rena::datalink::writer::write;
 use rena::frames::arp::ArpOperation;
 use rena::frames::ethernet::EtherType;
 use rena::frames::ethernet::EthernetFrame;
-use rena::packet::{ArpPacket, IcmpPacket};
+use rena::packet::ArpPacket;
+use rena::tcp::local_handler::LocalHandler;
+use std::io;
 use std::sync::Arc;
-use std::time::Duration;
 use structopt::StructOpt;
-use tokio::time::sleep;
 
 #[derive(StructOpt)]
 #[structopt(name = "basic")]
@@ -25,9 +26,9 @@ struct Opt {
     #[structopt(short, long)]
     dst_address: String,
 
-    // Ping times
-    #[structopt(short, long, default_value = "1")]
-    count: u16,
+    // dst tcp port
+    #[structopt(short, long, default_value = "8000")]
+    port: u16,
 }
 
 fn create_arp_request(sock: &RawSock, src_ip_addr: Ipv4Addr, dst_ip_addr: Ipv4Addr) -> BytesMut {
@@ -40,63 +41,35 @@ fn create_arp_request(sock: &RawSock, src_ip_addr: Ipv4Addr, dst_ip_addr: Ipv4Ad
         .build()
 }
 
-struct PingSession {
-    seq_num: u16,
-    dst_mac_address: MacAddr,
-    src_ip_address: Ipv4Addr,
-    dst_ip_address: Ipv4Addr,
-}
-
-impl PingSession {
-    pub fn new(
-        dst_mac_address: MacAddr,
-        src_ip_address: Ipv4Addr,
-        dst_ip_address: Ipv4Addr,
-    ) -> Self {
-        PingSession {
-            seq_num: 1,
-            dst_mac_address,
-            src_ip_address,
-            dst_ip_address,
-        }
-    }
-
-    fn new_echo_frame(&mut self, sock: &RawSock) -> BytesMut {
-        let frame = IcmpPacket::default()
-            .set_icmp_echo_request(self.seq_num)
-            .set_ipv4(self.src_ip_address, self.dst_ip_address)
-            .set_ether(sock.mac_addr, self.dst_mac_address)
-            .build();
-        self.seq_num += 1;
-        frame
-    }
-}
-
 #[tokio::main]
 async fn main() {
     env_logger::init();
     let opt = Opt::from_args();
 
     let sock = Arc::new(RawSock::new(&opt.interface).unwrap());
+    let mut rand_gen = thread_rng();
     let src_ip_addr = sock.ipv4_addr;
     let dst_ip_addr = Ipv4Addr::from_str(&opt.dst_address).unwrap();
+    // Same as linux's default range
+    // https://www.kernel.org/doc/html/latest//networking/ip-sysctl.html#ip-variables
+    let sport: u16 = rand_gen.gen_range(32768..60999);
+    let dport = opt.port;
 
     let arp_req = create_arp_request(&sock, src_ip_addr, dst_ip_addr);
     let res = write(sock.clone(), arp_req, None).await;
     if res.is_err() {
-        panic!("error");
+        panic!("error")
     }
-
     let mut arp_table = ArpTable::new();
 
     // wait arp response
     let mut buf = read(sock.clone(), None).await.data().unwrap();
     let ether = EthernetFrame::from_raw(&mut buf);
 
+    // TODO: implement graceful connection draining.
     match ether.frame_type() {
         EtherType::Arp => {
             let arp = ether.arp_payload().unwrap();
-
             match arp.opcode() {
                 ArpOperation::Response => {
                     arp.source_ipaddr().subnet_range = dst_ip_addr.subnet_range;
@@ -104,27 +77,36 @@ async fn main() {
                         .add(arp.source_ipaddr(), arp.source_macaddr())
                         .unwrap();
 
-                    // send icmp echo request
-                    let mut ping_session = PingSession::new(
-                        arp_table.lookup(dst_ip_addr).unwrap(),
+                    let smacaddr = sock.mac_addr;
+                    let mut handler = LocalHandler::connect(
+                        smacaddr,
+                        arp.source_macaddr(),
                         src_ip_addr,
                         dst_ip_addr,
-                    );
+                        sport,
+                        dport,
+                        sock,
+                    )
+                    .await
+                    .unwrap();
 
-                    for _ in 0..opt.count {
-                        let res =
-                            write(sock.clone(), ping_session.new_echo_frame(&sock), None).await;
-                        if res.is_err() {
-                            panic!("error");
+                    loop {
+                        let mut buffer = String::new();
+                        io::stdin().read_line(&mut buffer).unwrap();
+
+                        if buffer == "close\n" {
+                            handler.close().await;
+                            break;
+                        } else {
+                            buffer = buffer.strip_suffix("\n").unwrap().to_string();
+                            let n: usize = buffer.parse().unwrap();
+                            let mut payload = BytesMut::with_capacity(n);
+
+                            for _ in 0..n {
+                                payload.put_slice(&[b'a']);
+                            }
+                            handler.send(payload).await.unwrap();
                         }
-                        // wait icmp echo response
-                        let mut buf = read(sock.clone(), None).await.data().unwrap();
-                        let ether = EthernetFrame::from_raw(&mut buf);
-                        let ip = ether.ipv4_payload().unwrap();
-                        let icmp = ip.icmp_payload().unwrap();
-                        println!("{}", &icmp);
-
-                        sleep(Duration::from_secs(1)).await;
                     }
                 }
                 _ => {}
