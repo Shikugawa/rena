@@ -238,27 +238,3 @@ impl LocalHandler {
         chunked_raw_frames
     }
 }
-
-fn parse_tcp_packet<'a>(mut buf: Buffer) -> Result<TcpFrame> {
-    let ether = EthernetFrame::from_raw(&mut buf);
-    if ether.frame_type() != EtherType::Ipv4 {
-        return Err(anyhow!("not ipv4"));
-    }
-
-    let ip = ether.ipv4_payload();
-    if ip.is_err() {
-        return Err(anyhow!("failed to parse ipv4"));
-    }
-
-    let ip = ip.unwrap();
-    if ip.protocol() != IpProtocol::Tcp {
-        return Err(anyhow!("not tcp"));
-    }
-
-    let tcp = ip.tcp_payload();
-    if tcp.is_err() {
-        return Err(anyhow!("failed to parse tcp payload"));
-    }
-
-    Ok(tcp.unwrap().to_owned())
-}
