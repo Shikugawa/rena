@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::frames::tcp::TcpFrame;
+use crate::tcp::subscriber::Subscriber;
 use crate::{
     datalink::{
         reader::{read, ReadResult},
@@ -11,26 +12,48 @@ use crate::{
         ipv4::IpProtocol,
     },
 };
+use log::error;
+use once_cell::sync::Lazy;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+static mut WORKER_SUBSCRIPTIONS: Lazy<HashMap<u16, mpsc::Sender<TcpFrame>>> =
+    Lazy::new(|| HashMap::new());
+
 pub struct FrameReceiver {
     handle: Option<JoinHandle<()>>,
-    subscriptions: HashMap<u16, mpsc::Sender<TcpFrame>>,
+    subscriptions_locked: bool,
 }
 
 impl FrameReceiver {
-    pub fn new(sock: Arc<dyn DatalinkReaderWriter>) -> Self {
-        let receiver = Self {
+    pub fn new() -> Self {
+        Self {
             handle: None,
-            subscriptions: HashMap::new(),
-        };
+            subscriptions_locked: false,
+        }
+    }
 
-        let handle = tokio::spawn(async {
+    pub fn subscribe(&self, dport: u16, subscriber: &mut dyn Subscriber) {
+        if self.subscriptions_locked {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel(1 << 10);
+        subscriber.subscribe(rx);
+
+        // This unsafe is safe because subscription is not allowed after receiver thread is started.
+        unsafe {
+            WORKER_SUBSCRIPTIONS.insert(dport, tx);
+        }
+    }
+
+    pub fn run(&mut self, sock: Arc<dyn DatalinkReaderWriter>) {
+        self.subscriptions_locked = true;
+        self.handle = Some(tokio::spawn(async move {
             loop {
-                let res = read(sock, None).await;
+                let res = read(sock.clone(), None).await;
                 match res {
-                    ReadResult::Success(buf) => {
+                    ReadResult::Success(mut buf) => {
                         let ether = EthernetFrame::from_raw(&mut buf);
                         if ether.frame_type() != EtherType::Ipv4 {
                             continue;
@@ -50,15 +73,33 @@ impl FrameReceiver {
                         if tcp.is_err() {
                             continue;
                         }
+                        let tcp_owned = tcp.unwrap().to_owned();
+                        let dport = tcp_owned.dport();
 
-                        let dport = tcp.unwrap().dport();
+                        unsafe {
+                            if WORKER_SUBSCRIPTIONS.contains_key(&dport) {
+                                if let Err(err) = WORKER_SUBSCRIPTIONS
+                                    .get(&dport)
+                                    .unwrap()
+                                    .send(tcp_owned)
+                                    .await
+                                {
+                                    error!("failed to read packet due to some reasons: {}", err)
+                                }
+                            }
+                        }
                     }
                     ReadResult::Timeout => {}
                 }
             }
-        });
+        }));
+    }
 
-        receiver.handle = Some(handle);
-        receiver
+    pub async fn close(&mut self) {
+        if self.handle.is_some() {
+            let handle = self.handle.as_mut();
+            // TODO: prepare shutdown signal
+            handle.unwrap().await;
+        }
     }
 }

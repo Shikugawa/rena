@@ -1,22 +1,20 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
-use crate::buffer::Buffer;
 use crate::datalink::rawsock::RawSock;
-use crate::datalink::reader::{read, ReadResult};
 use crate::datalink::traits::DatalinkReaderWriter;
 use crate::datalink::writer::{write, WriteResult};
-use crate::frames::ethernet::{EtherType, EthernetFrame};
 use crate::frames::frame::Frame;
-use crate::frames::ipv4::IpProtocol;
 use crate::frames::tcp::TcpFrame;
 use crate::packet::TcpPacket;
 use crate::tcp::active_session::ActiveSession;
+use crate::tcp::subscriber::Subscriber;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use log::{info, warn};
 use std::cmp::min;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
 
 pub struct LocalHandler {
@@ -31,6 +29,13 @@ pub struct LocalHandler {
     // If retransmission which is triggered by 1) duplicated ack_num, 2) ack timeout
     // is occurred, the number of packet will be enqueued repeatedly here.
     pending_message_queue: VecDeque<(usize, Instant)>,
+    rx: Option<mpsc::Receiver<TcpFrame>>,
+}
+
+impl Subscriber for LocalHandler {
+    fn subscribe(&mut self, rx: mpsc::Receiver<TcpFrame>) {
+        self.rx = Some(rx);
+    }
 }
 
 impl LocalHandler {
@@ -52,6 +57,7 @@ impl LocalHandler {
             session,
             sock: sock,
             pending_message_queue: VecDeque::new(),
+            rx: None,
         };
         local_handler.handshake().await;
         Ok(local_handler)
@@ -81,6 +87,8 @@ impl LocalHandler {
         // 2) If ACKs can't be received via timeout, handler execute transmission
         //    for failed SYN message immediately.
         while next_idx < raw_packets.len() {
+            let rx = self.rx.as_mut().unwrap();
+
             tokio::select! {
                 instant = interval.tick() => {
                     while !self.pending_message_queue.is_empty() {
@@ -100,15 +108,9 @@ impl LocalHandler {
                         self.pending_message_queue.push_back((idx, new_deadline));
                     }
                 },
-                res = read(self.sock.clone(), None) => {
+                res = rx.recv() => {
                     match res {
-                        ReadResult::Success(buf) => {
-                            let tcp_frame = parse_tcp_packet(buf);
-                            if tcp_frame.is_err() {
-                                continue;
-                            }
-
-                            let tcp_frame = tcp_frame.unwrap();
+                        Some(tcp_frame) => {
                             self.pending_message_queue.pop_front().unwrap();
 
                             if !self.session.on_recv_tcp_frame(&tcp_frame) {
@@ -123,7 +125,7 @@ impl LocalHandler {
 
                             self.send_data_internal(next_idx, raw_packets[next_idx].1.clone()).await;
                         }
-                        ReadResult::Timeout => {}
+                        None => {}
                     }
                 }
             }
@@ -183,26 +185,19 @@ impl LocalHandler {
         }
     }
 
-    async fn recv_packet(&mut self, timeout: Option<Duration>) -> ReadResult {
-        // TODO: current implementation is not enough because it may occur massive packet copies
-        // if user has many handlers. We should create receive handler which transports received message
-        // to the destination handler.
+    // TODO: timeout
+    async fn recv_packet(&mut self, timeout: Option<Duration>) -> bool {
         loop {
-            let res = read(self.sock.clone(), timeout).await;
+            let rx = self.rx.as_mut().unwrap();
+            let res = rx.recv().await;
             match res {
-                ReadResult::Success(buf) => {
-                    let tcp_frame = parse_tcp_packet(buf);
-                    if tcp_frame.is_err() {
+                Some(tcp_frame) => {
+                    if !self.session.on_recv_tcp_frame(&tcp_frame) {
                         continue;
                     }
-                    if !self.session.on_recv_tcp_frame(&tcp_frame.unwrap()) {
-                        continue;
-                    }
-                    return res;
+                    return true;
                 }
-                ReadResult::Timeout => {
-                    return res;
-                }
+                None => return false,
             }
         }
     }
