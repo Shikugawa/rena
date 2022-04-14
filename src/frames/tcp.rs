@@ -212,6 +212,10 @@ impl TcpFrame {
         frame
     }
 
+    pub fn dport(&self) -> u16 {
+        self.dport
+    }
+
     pub fn window_size(&self) -> u16 {
         self.window_size
     }

@@ -10,6 +10,7 @@ use rena::frames::arp::ArpOperation;
 use rena::frames::ethernet::EtherType;
 use rena::frames::ethernet::EthernetFrame;
 use rena::packet::ArpPacket;
+use rena::tcp::frame_receiver::FrameReceiver;
 use rena::tcp::local_handler::LocalHandler;
 use std::io;
 use std::sync::Arc;
@@ -78,6 +79,8 @@ async fn main() {
                         .unwrap();
 
                     let smacaddr = sock.mac_addr;
+                    let receiver = FrameReceiver::new();
+
                     let mut handler = LocalHandler::connect(
                         smacaddr,
                         arp.source_macaddr(),
@@ -86,6 +89,7 @@ async fn main() {
                         sport,
                         dport,
                         sock,
+                        receiver,
                     )
                     .await
                     .unwrap();
