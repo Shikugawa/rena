@@ -33,7 +33,7 @@ impl FrameReceiver {
         }
     }
 
-    pub fn subscribe(&self, dport: u16, subscriber: &mut dyn Subscriber) {
+    pub fn subscribe(&self, sport: u16, subscriber: &mut dyn Subscriber) {
         if self.subscriptions_locked {
             return;
         }
@@ -43,7 +43,7 @@ impl FrameReceiver {
 
         // This unsafe is safe because subscription is not allowed after receiver thread is started.
         unsafe {
-            WORKER_SUBSCRIPTIONS.insert(dport, tx);
+            WORKER_SUBSCRIPTIONS.insert(sport, tx);
         }
     }
 

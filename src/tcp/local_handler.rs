@@ -17,6 +17,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
 
+use super::frame_receiver::FrameReceiver;
+
 pub struct LocalHandler {
     smacaddr: MacAddr,
     dmacaddr: MacAddr,
@@ -47,6 +49,7 @@ impl LocalHandler {
         sport: u16,
         dport: u16,
         sock: Arc<RawSock>,
+        mut receiver: FrameReceiver,
     ) -> Result<Self> {
         let session = ActiveSession::new(sipaddr, dipaddr, sport, dport);
         let mut local_handler = LocalHandler {
@@ -59,6 +62,9 @@ impl LocalHandler {
             pending_message_queue: VecDeque::new(),
             rx: None,
         };
+        receiver.subscribe(sport, &mut local_handler);
+        receiver.run(local_handler.sock.clone());
+
         local_handler.handshake().await;
         Ok(local_handler)
     }
