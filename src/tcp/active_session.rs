@@ -2,6 +2,7 @@ use crate::addresses::ipv4::Ipv4Addr;
 use crate::frames::frame::Frame;
 use crate::frames::tcp::TcpFrame;
 use crate::tcp::state::State;
+use crate::tcp::state::TcpFiniteStateMachineCallbacks;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use log::info;
@@ -31,6 +32,16 @@ pub struct ActiveSession {
     // acknum_counter is used to accumulate local-side segment retransmission,
     // which is exepcted to be used after the count is larger than 4.
     acknum_counter: HashMap<u32, usize>,
+    exepcted_state: State,
+}
+
+impl TcpFiniteStateMachineCallbacks for ActiveSession {
+    fn on_syn_sent(&mut self) {
+        // In handshake, payload bytes should be treated as 1 bytes.
+        let payload_bytes = 1;
+        self.update_sent_bytes(payload_bytes);
+        self.update_next_seq_num(payload_bytes);
+    }
 }
 
 impl ActiveSession {
@@ -50,6 +61,7 @@ impl ActiveSession {
             mss: 1460,
             waiting_acks: HashSet::new(),
             acknum_counter: HashMap::new(),
+            exepcted_state: State::Closed,
         }
     }
 
@@ -145,12 +157,23 @@ impl ActiveSession {
                 } else if frame.is_ack() && frame.is_syn() {
                     self.update_next_ack_num(frame.seq_num() + 1);
                     self.update_window_size(frame.window_size());
+                    self.exepcted_state = State::Established;
+                } else if frame.is_syn() {
+                    self.update_next_ack_num(frame.seq_num() + 1);
+                    self.exepcted_state = State::SynReceived;
+                } else {
+                    valid = false;
+                }
+            }
+            State::SynReceived => {
+                if frame.is_syn() && frame.is_ack() {
+                    self.update_state(State::Established);
                 } else {
                     valid = false;
                 }
             }
             State::Established => {
-                if frame.is_fin() && frame.is_ack() {
+                if frame.is_fin() {
                     self.update_state(State::CloseWait);
                 } else if frame.is_ack() {
                     self.update_next_ack_num(frame.seq_num() + frame.payload_length() as u32);
@@ -163,6 +186,29 @@ impl ActiveSession {
                 if frame.is_fin() && frame.is_ack() {
                     self.update_state(State::FinWait2);
                     self.update_next_ack_num(frame.seq_num() + 1);
+                } else if frame.is_fin() {
+                    self.update_state(State::Closing);
+                } else {
+                    valid = false;
+                }
+            }
+            State::FinWait2 => {
+                if frame.is_fin() {
+                    self.update_state(State::TimeWait);
+                } else {
+                    valid = false;
+                }
+            }
+            State::Closing => {
+                if frame.is_fin() && frame.is_ack() {
+                    self.update_state(State::TimeWait);
+                } else {
+                    valid = false;
+                }
+            }
+            State::LastAck => {
+                if frame.is_fin() && frame.is_ack() {
+                    self.update_state(State::Closed);
                 } else {
                     valid = false;
                 }
@@ -205,7 +251,8 @@ impl ActiveSession {
                 self.update_next_seq_num(payload_bytes);
             }
             State::SynSent => {
-                self.update_state(State::Established);
+                self.update_state(self.exepcted_state);
+                self.exepcted_state = State::Closed;
             }
             State::Established => {
                 if frame.is_fin() {
