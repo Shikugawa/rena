@@ -1,15 +1,12 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::frames::frame::Frame;
 use crate::frames::tcp::TcpFrame;
-use crate::tcp::finite_state_machine::State;
-// use crate::tcp::finite_state_machine::TcpFiniteStateMachineCallbacks;
+use crate::tcp::state::{Event, State};
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use log::info;
 use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet};
-// use super::finite_state_machine::Event;
-// use super::finite_state_machine::TcpFiniteStateMachine;
 
 // TODO: follow spec
 fn isn_gen() -> u32 {
@@ -18,8 +15,7 @@ fn isn_gen() -> u32 {
 }
 
 pub struct ActiveSession {
-    // state_machine: Option<TcpFiniteStateMachine<Self>>,
-    state: Box<dyn TcpState>,
+    state: State,
     sipaddr: Ipv4Addr,
     dipaddr: Ipv4Addr,
     sport: u16,
@@ -37,442 +33,10 @@ pub struct ActiveSession {
     acknum_counter: HashMap<u32, usize>,
 }
 
-// impl TcpFiniteStateMachineCallbacks for ActiveSession {
-//     fn on_syn_sent(&mut self, _: &TcpFrame) {
-//         // In handshake, payload bytes should be treated as 1 bytes.
-//         let payload_bytes = 1;
-//         self.update_sent_bytes(payload_bytes);
-//         self.update_next_seq_num(payload_bytes);
-//     }
-
-//     fn on_wait_send_ack_to_established(&mut self, frame: &TcpFrame) {
-//         self.update_next_ack_num(frame.seq_num() + 1);
-//         self.update_window_size(frame.window_size());
-//     }
-
-//     fn on_established(&mut self, _: &TcpFrame) {}
-
-//     fn on_fin_wait1(&mut self, _: &TcpFrame) {
-//         // In close handshake, payload bytes should be treated as 1 bytes.
-//         let payload_bytes = 1;
-//         self.update_sent_bytes(payload_bytes);
-//         self.update_next_seq_num(payload_bytes);
-//     }
-
-//     fn on_fin_wait2(&mut self, frame: &TcpFrame) {
-//         self.update_next_ack_num(frame.seq_num() + 1);
-//     }
-
-//     fn on_syn_received(&mut self, frame: &TcpFrame) {
-//         self.update_next_ack_num(frame.seq_num() + 1);
-//     }
-// }
-
-trait TcpState {
-    fn recv(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState>;
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState>;
-
-    fn open(&mut self) -> Box<dyn TcpState>;
-
-    fn close(&mut self) -> Box<dyn TcpState>;
-}
-
-struct Closed;
-
-impl TcpState for Closed {
-    fn recv(&mut self, _: &TcpFrame, _: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn sent(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        // In handshake, payload bytes should be treated as 1 bytes.
-        let payload_bytes = 1;
-        session.update_sent_bytes(payload_bytes);
-        session.update_next_seq_num(payload_bytes);
-        Box::new(SynSent {})
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        Box::new(Listen {})
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct Listen;
-
-impl TcpState for Listen {
-    fn recv(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        unimplemented!()
-    }
-
-    fn sent(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        unimplemented!()
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        Box::new(Closed {})
-    }
-}
-
-struct SynSent;
-
-impl TcpState for SynSent {
-    fn recv(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_syn() && frame.is_ack() {
-            return Box::new(WaitSendAckToEstablished {});
-        }
-
-        if frame.is_syn() {
-            return Box::new(WaitSendAckToSynReceived {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn sent(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct WaitSendAckToSynReceived;
-
-impl TcpState for WaitSendAckToSynReceived {
-    fn recv(&mut self, _: &TcpFrame, _: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_ack() {
-            return Box::new(SynReceived {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct SynReceived;
-
-impl TcpState for SynReceived {
-    fn recv(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_syn() && frame.is_ack() {
-            return Box::new(Established {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_fin() {
-            return Box::new(FinWait1 {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct WaitSendAckToEstablished;
-
-impl TcpState for WaitSendAckToEstablished {
-    fn recv(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_ack() {
-            return Box::new(Established {});
-        }
-
-        panic!("undefined state change")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct Established;
-
-impl TcpState for Established {
-    fn recv(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_fin() {
-            return Box::new(WaitSendAckToCloseWait {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_fin() {
-            return Box::new(FinWait1 {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct WaitSendAckToCloseWait;
-
-impl TcpState for WaitSendAckToCloseWait {
-    fn recv(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_ack() {
-            return Box::new(CloseWait {});
-        }
-
-        panic!("undefined state change")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct CloseWait;
-
-impl TcpState for CloseWait {
-    fn recv(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_fin() {
-            return Box::new(LastAck {});
-        }
-
-        panic!("undefined state change")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct FinWait1;
-
-impl TcpState for FinWait1 {
-    fn recv(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_fin() && frame.is_ack() {
-            return Box::new(FinWait2 {});
-        }
-
-        if frame.is_fin() {
-            return Box::new(Closing {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("not reached")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-struct FinWait2;
-
-impl TcpState for FinWait2 {
-    fn recv(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_fin() {
-            return Box::new(WaitSendAckToTimeWait {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("not reached")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct WaitSendAckToClosing;
-
-impl TcpState for WaitSendAckToClosing {
-    fn recv(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_ack() {
-            return Box::new(Closing {});
-        }
-
-        panic!("undefined state change")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct Closing;
-
-impl TcpState for Closing {
-    fn recv(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_fin() && frame.is_ack() {
-            return Box::new(TimeWait {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("not reached")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct LastAck;
-
-impl TcpState for LastAck {
-    fn recv(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_fin() && frame.is_ack() {
-            return Box::new(Closed {});
-        }
-
-        panic!("not reached")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("not reached")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct WaitSendAckToTimeWait;
-
-impl TcpState for WaitSendAckToTimeWait {
-    fn recv(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        if frame.is_ack() {
-            return Box::new(Closing {});
-        }
-
-        panic!("undefined state change")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
-struct TimeWait;
-
-impl TcpState for TimeWait {
-    fn recv(&mut self, _: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn sent(&mut self, frame: &TcpFrame, session: &mut ActiveSession) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn open(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-
-    fn close(&mut self) -> Box<dyn TcpState> {
-        panic!("undefined state change")
-    }
-}
-
 impl ActiveSession {
     pub fn new(sipaddr: Ipv4Addr, dipaddr: Ipv4Addr, sport: u16, dport: u16) -> Self {
         let isn = isn_gen();
-        let mut session = ActiveSession {
+        Self {
             sipaddr,
             dipaddr,
             sport,
@@ -485,11 +49,8 @@ impl ActiveSession {
             mss: 1460,
             waiting_acks: HashSet::new(),
             acknum_counter: HashMap::new(),
-            state: Box::new(SynSent {}),
-        };
-        // Box::new(session);
-        // session.state_machine = Some(TcpFiniteStateMachine::new(Box::new(&session)));
-        session
+            state: State::Closed,
+        }
     }
 
     pub fn create_next_frame(&mut self, close: bool) -> Result<TcpFrame> {
@@ -504,7 +65,7 @@ impl ActiveSession {
             BytesMut::new(),
         );
 
-        match self.state() {
+        match self.state {
             State::Closed => {
                 frame.set_syn();
             }
@@ -538,7 +99,7 @@ impl ActiveSession {
     }
 
     pub fn create_next_data_frame(&mut self, payload: BytesMut) -> Result<Vec<TcpFrame>> {
-        if self.state() != State::Established {
+        if self.state != State::Established {
             return Err(anyhow!("session state must be ESTABLISHED"));
         }
         let chunked_payloads = payload.chunks(self.mss as usize);
@@ -576,11 +137,8 @@ impl ActiveSession {
 
         self.waiting_acks.remove(&ack_num);
         self.inc_acknum_counter(&ack_num);
+        self.update(Event::ReceiveFrame(frame));
 
-        // self.state_machine
-        //     .as_mut()
-        //     .unwrap()
-        //     .update(Event::ReceiveFrame(frame));
         true
     }
 
@@ -593,16 +151,8 @@ impl ActiveSession {
         (self.window_size / self.mss) as usize
     }
 
-    fn state(&self) -> State {
-        State::Closed
-        // self.state_machine.unwrap().get_state()
-    }
-
     fn on_send(&mut self, frame: &TcpFrame) {
-        // self.state_machine
-        //     .as_mut()
-        //     .unwrap()
-        //     .update(Event::SendFrame(frame));
+        self.update(Event::SendFrame(frame));
     }
 
     fn inc_acknum_counter(&mut self, ack_num: &u32) {
@@ -639,6 +189,254 @@ impl ActiveSession {
         let tmp = self.window_size;
         self.window_size = num;
         info!("window size updated {} -> {}", tmp, self.window_size);
+    }
+
+    // TODO: need refactor
+    fn update(&mut self, event: Event) {
+        match self.state {
+            State::Closed => {
+                if event.frame().is_none() {
+                    self.update_state(event.frame(), State::Listen);
+                } else if event.frame().is_some() && event.frame().unwrap().is_syn() {
+                    self.update_state(event.frame(), State::SynSent)
+                }
+            }
+            State::Listen => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_recv_frame() && frame_internal.is_syn() {
+                    self.update_state(event.frame(), State::WaitSendAckToSynReceived);
+                    return;
+                }
+
+                if event.is_send_frame() && frame_internal.is_syn() {
+                    self.update_state(event.frame(), State::SynSent);
+                }
+            }
+            State::SynSent => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_recv_frame() && frame_internal.is_syn() && frame_internal.is_ack() {
+                    self.update_state(event.frame(), State::WaitSendAckToEstablished);
+                    return;
+                }
+
+                if event.is_recv_frame() && frame_internal.is_syn() {
+                    self.update_state(event.frame(), State::SynReceived);
+                    return;
+                }
+            }
+            State::SynReceived => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_recv_frame() && frame_internal.is_syn() && frame_internal.is_ack() {
+                    self.update_state(event.frame(), State::Established);
+                    return;
+                }
+
+                if event.is_send_frame() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::FinWait1);
+                    return;
+                }
+            }
+            State::Established => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_recv_frame() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::WaitSendAckToCloseWait);
+                    return;
+                }
+
+                if event.is_send_frame() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::FinWait1);
+                    return;
+                }
+            }
+            State::CloseWait => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_send_frame() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::LastAck);
+                    return;
+                }
+            }
+            State::LastAck => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_send_frame() && frame_internal.is_ack() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::Closed);
+                    return;
+                }
+            }
+            State::FinWait1 => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_recv_frame() && frame_internal.is_ack() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::FinWait2);
+                    return;
+                }
+
+                if event.is_recv_frame() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::WaitSendAckToClosing);
+                    return;
+                }
+            }
+            State::FinWait2 => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_recv_frame() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::WaitSendAckToTimeWait);
+                    return;
+                }
+            }
+            State::Closing => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_recv_frame() && frame_internal.is_ack() && frame_internal.is_fin() {
+                    self.update_state(event.frame(), State::TimeWait);
+                    return;
+                }
+            }
+            State::TimeWait => {
+                if event.is_timeout() {
+                    self.update_state(None, State::Closed);
+                }
+            }
+            State::WaitSendAckToSynReceived => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_send_frame() && frame_internal.is_ack() {
+                    self.update_state(event.frame(), State::SynReceived);
+                }
+            }
+            State::WaitSendAckToEstablished => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_send_frame() && frame_internal.is_ack() {
+                    self.update_state(event.frame(), State::Established);
+                }
+            }
+            State::WaitSendAckToCloseWait => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_send_frame() && frame_internal.is_ack() {
+                    self.update_state(event.frame(), State::CloseWait);
+                }
+            }
+            State::WaitSendAckToClosing => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_send_frame() && frame_internal.is_ack() {
+                    self.update_state(event.frame(), State::Closing);
+                }
+            }
+            State::WaitSendAckToTimeWait => {
+                if event.frame().is_none() {
+                    return;
+                }
+                let frame_internal = event.frame().unwrap();
+
+                if event.is_send_frame() && frame_internal.is_ack() {
+                    self.update_state(event.frame(), State::TimeWait);
+                }
+            }
+        }
+    }
+
+    fn update_state(&mut self, frame: Option<&TcpFrame>, next_state: State) {
+        let prev_state = self.state;
+        self.state = next_state;
+
+        if let Some(frame) = frame {
+            match self.state {
+                State::Closed => {}
+                State::Listen => {}
+                State::SynSent => self.on_syn_sent(frame),
+                State::SynReceived => self.on_syn_received(frame),
+                State::Established => self.on_established(frame),
+                State::LastAck => {}
+                State::CloseWait => {}
+                State::FinWait1 => self.on_fin_wait1(frame),
+                State::FinWait2 => self.on_fin_wait2(frame),
+                State::Closing => {}
+                State::TimeWait => {}
+                State::WaitSendAckToSynReceived => {}
+                State::WaitSendAckToEstablished => self.on_wait_send_ack_to_established(frame),
+                State::WaitSendAckToCloseWait => {}
+                State::WaitSendAckToClosing => {}
+                State::WaitSendAckToTimeWait => {}
+            }
+        }
+
+        info!("TCP Session changed state {} -> {}", prev_state, self.state)
+    }
+
+    fn on_syn_sent(&mut self, _: &TcpFrame) {
+        // In handshake, payload bytes should be treated as 1 bytes.
+        let payload_bytes = 1;
+        self.update_sent_bytes(payload_bytes);
+        self.update_next_seq_num(payload_bytes);
+    }
+
+    fn on_wait_send_ack_to_established(&mut self, frame: &TcpFrame) {
+        self.update_next_ack_num(frame.seq_num() + 1);
+        self.update_window_size(frame.window_size());
+    }
+
+    fn on_established(&mut self, _: &TcpFrame) {}
+
+    fn on_fin_wait1(&mut self, _: &TcpFrame) {
+        // In close handshake, payload bytes should be treated as 1 bytes.
+        let payload_bytes = 1;
+        self.update_sent_bytes(payload_bytes);
+        self.update_next_seq_num(payload_bytes);
+    }
+
+    fn on_fin_wait2(&mut self, frame: &TcpFrame) {
+        self.update_next_ack_num(frame.seq_num() + 1);
+    }
+
+    fn on_syn_received(&mut self, frame: &TcpFrame) {
+        self.update_next_ack_num(frame.seq_num() + 1);
     }
 }
 
