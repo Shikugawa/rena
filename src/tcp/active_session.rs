@@ -1,13 +1,15 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::frames::frame::Frame;
 use crate::frames::tcp::TcpFrame;
-use crate::tcp::state::State;
-use crate::tcp::state::TcpFiniteStateMachineCallbacks;
+use crate::tcp::finite_state_machine::State;
+use crate::tcp::finite_state_machine::TcpFiniteStateMachineCallbacks;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use log::info;
 use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet};
+
+use super::finite_state_machine::TcpFiniteStateMachine;
 
 // TODO: follow spec
 fn isn_gen() -> u32 {
@@ -15,7 +17,8 @@ fn isn_gen() -> u32 {
     rng.gen()
 }
 
-pub struct ActiveSession {
+pub struct ActiveSession<'a> {
+    state_machine: Option<TcpFiniteStateMachine<'a, Self>>,
     sipaddr: Ipv4Addr,
     dipaddr: Ipv4Addr,
     sport: u16,
@@ -33,7 +36,7 @@ pub struct ActiveSession {
     acknum_counter: HashMap<u32, usize>,
 }
 
-impl TcpFiniteStateMachineCallbacks for ActiveSession {
+impl<'a> TcpFiniteStateMachineCallbacks for ActiveSession<'a> {
     fn on_syn_sent(&mut self, _: &TcpFrame) {
         // In handshake, payload bytes should be treated as 1 bytes.
         let payload_bytes = 1;
@@ -64,10 +67,10 @@ impl TcpFiniteStateMachineCallbacks for ActiveSession {
     }
 }
 
-impl ActiveSession {
+impl<'a> ActiveSession<'a> {
     pub fn new(sipaddr: Ipv4Addr, dipaddr: Ipv4Addr, sport: u16, dport: u16) -> Self {
         let isn = isn_gen();
-        ActiveSession {
+        let mut session = ActiveSession {
             sipaddr,
             dipaddr,
             sport,
@@ -80,7 +83,10 @@ impl ActiveSession {
             mss: 1460,
             waiting_acks: HashSet::new(),
             acknum_counter: HashMap::new(),
-        }
+            state_machine: None,
+        };
+        session.state_machine = Some(TcpFiniteStateMachine::new(&session));
+        session
     }
 
     pub fn create_next_frame(&mut self, close: bool) -> Result<TcpFrame> {
@@ -95,7 +101,7 @@ impl ActiveSession {
             BytesMut::new(),
         );
 
-        match self.state {
+        match self.state() {
             State::Closed => {
                 frame.set_syn();
             }
@@ -123,13 +129,13 @@ impl ActiveSession {
         let waiting_ack = frame.seq_num() + 1;
         self.waiting_acks.insert(waiting_ack);
 
-        self.on_send_tcp_frame(&frame);
+        // self.on_send_tcp_frame(&frame);
 
         Ok(frame)
     }
 
     pub fn create_next_data_frame(&mut self, payload: BytesMut) -> Result<Vec<TcpFrame>> {
-        if self.state != State::Established {
+        if self.state() != State::Established {
             return Err(anyhow!("session state must be ESTABLISHED"));
         }
         let chunked_payloads = payload.chunks(self.mss as usize);
@@ -150,7 +156,7 @@ impl ActiveSession {
 
             let waiting_ack = frame.seq_num() + (frame.payload_length() as u32);
             self.waiting_acks.insert(waiting_ack);
-            self.on_send_tcp_frame(&frame);
+            // self.on_send_tcp_frame(&frame);
 
             frames.push(frame);
         }
@@ -163,12 +169,12 @@ impl ActiveSession {
         self.init_seq_num
     }
 
-    pub fn state(&self) -> State {
-        self.state
-    }
-
     pub fn can_send_packet_num(&self) -> usize {
         (self.window_size / self.mss) as usize
+    }
+
+    fn state(&self) -> State {
+        self.state_machine.unwrap().get_state()
     }
 
     fn inc_acknum_counter(&mut self, ack_num: &u32) {
@@ -208,9 +214,9 @@ impl ActiveSession {
     }
 }
 
-impl Drop for ActiveSession {
+impl<'a> Drop for ActiveSession<'a> {
     fn drop(&mut self) {
         // TODO: send drop packet in close
-        self.update_state(State::Closed);
+        // self.update_state(State::Closed);
     }
 }

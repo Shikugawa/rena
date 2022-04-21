@@ -152,7 +152,7 @@ pub trait TcpFiniteStateMachineCallbacks {
     fn on_syn_received(&mut self, frame: &TcpFrame);
 }
 
-struct TcpFiniteStateMachine<'a, T>
+pub struct TcpFiniteStateMachine<'a, T>
 where
     T: TcpFiniteStateMachineCallbacks,
 {
@@ -164,6 +164,17 @@ impl<'a, T> TcpFiniteStateMachine<'a, T>
 where
     T: TcpFiniteStateMachineCallbacks,
 {
+    pub fn new(callbacks: &'a T) -> Self {
+        Self {
+            state: State::Closed,
+            callbacks,
+        }
+    }
+
+    pub fn get_state(&self) -> State {
+        self.state
+    }
+
     pub fn update(&mut self, event: Event) {
         match self.state {
             State::Closed => {
