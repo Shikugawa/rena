@@ -69,7 +69,7 @@ impl ActiveSession {
             State::Closed => {
                 frame.set_syn();
             }
-            State::SynSent => {
+            State::WaitSendAckToEstablished => {
                 frame.set_ack();
             }
             State::Established => {
@@ -78,14 +78,11 @@ impl ActiveSession {
                     frame.set_ack();
                 }
             }
-            State::FinWait2 => {
+            State::WaitSendAckToTimeWait => {
                 frame.set_ack();
             }
             State::CloseWait => {
                 frame.set_fin();
-            }
-            State::LastAck => {
-                frame.set_ack();
             }
             _ => return Err(anyhow!("failed to create TCP frame")),
         }
