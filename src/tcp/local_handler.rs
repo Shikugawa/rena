@@ -119,7 +119,7 @@ impl LocalHandler {
                         Some(tcp_frame) => {
                             self.pending_message_queue.pop_front().unwrap();
 
-                            if !self.session.on_recv_tcp_frame(&tcp_frame) {
+                            if !self.session.on_recv(&tcp_frame) {
                                 continue;
                             }
 
@@ -198,7 +198,7 @@ impl LocalHandler {
             let res = rx.recv().await;
             match res {
                 Some(tcp_frame) => {
-                    if !self.session.on_recv_tcp_frame(&tcp_frame) {
+                    if !self.session.on_recv(&tcp_frame) {
                         continue;
                     }
                     return true;
