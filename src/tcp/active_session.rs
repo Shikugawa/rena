@@ -16,7 +16,6 @@ fn isn_gen() -> u32 {
 }
 
 pub struct ActiveSession {
-    state: State,
     sipaddr: Ipv4Addr,
     dipaddr: Ipv4Addr,
     sport: u16,
@@ -32,15 +31,36 @@ pub struct ActiveSession {
     // acknum_counter is used to accumulate local-side segment retransmission,
     // which is exepcted to be used after the count is larger than 4.
     acknum_counter: HashMap<u32, usize>,
-    exepcted_state: State,
 }
 
 impl TcpFiniteStateMachineCallbacks for ActiveSession {
-    fn on_syn_sent(&mut self) {
+    fn on_syn_sent(&mut self, _: &TcpFrame) {
         // In handshake, payload bytes should be treated as 1 bytes.
         let payload_bytes = 1;
         self.update_sent_bytes(payload_bytes);
         self.update_next_seq_num(payload_bytes);
+    }
+
+    fn on_wait_send_ack_to_established(&mut self, frame: &TcpFrame) {
+        self.update_next_ack_num(frame.seq_num() + 1);
+        self.update_window_size(frame.window_size());
+    }
+
+    fn on_established(&mut self, _: &TcpFrame) {}
+
+    fn on_fin_wait1(&mut self, _: &TcpFrame) {
+        // In close handshake, payload bytes should be treated as 1 bytes.
+        let payload_bytes = 1;
+        self.update_sent_bytes(payload_bytes);
+        self.update_next_seq_num(payload_bytes);
+    }
+
+    fn on_fin_wait2(&mut self, frame: &TcpFrame) {
+        self.update_next_ack_num(frame.seq_num() + 1);
+    }
+
+    fn on_syn_received(&mut self, frame: &TcpFrame) {
+        self.update_next_ack_num(frame.seq_num() + 1);
     }
 }
 
@@ -48,7 +68,6 @@ impl ActiveSession {
     pub fn new(sipaddr: Ipv4Addr, dipaddr: Ipv4Addr, sport: u16, dport: u16) -> Self {
         let isn = isn_gen();
         ActiveSession {
-            state: State::Closed,
             sipaddr,
             dipaddr,
             sport,
@@ -61,7 +80,6 @@ impl ActiveSession {
             mss: 1460,
             waiting_acks: HashSet::new(),
             acknum_counter: HashMap::new(),
-            exepcted_state: State::Closed,
         }
     }
 
@@ -140,85 +158,6 @@ impl ActiveSession {
         Ok(frames)
     }
 
-    pub fn on_recv_tcp_frame(&mut self, frame: &TcpFrame) -> bool {
-        let ack_num = frame.ack_num();
-        if !self.waiting_acks.contains(&ack_num) {
-            return false;
-        }
-
-        self.waiting_acks.remove(&ack_num);
-        self.inc_acknum_counter(&ack_num);
-
-        let mut valid = true;
-        match self.state {
-            State::SynSent => {
-                if frame.is_rst() {
-                    self.update_state(State::Closed);
-                } else if frame.is_ack() && frame.is_syn() {
-                    self.update_next_ack_num(frame.seq_num() + 1);
-                    self.update_window_size(frame.window_size());
-                    self.exepcted_state = State::Established;
-                } else if frame.is_syn() {
-                    self.update_next_ack_num(frame.seq_num() + 1);
-                    self.exepcted_state = State::SynReceived;
-                } else {
-                    valid = false;
-                }
-            }
-            State::SynReceived => {
-                if frame.is_syn() && frame.is_ack() {
-                    self.update_state(State::Established);
-                } else {
-                    valid = false;
-                }
-            }
-            State::Established => {
-                if frame.is_fin() {
-                    self.update_state(State::CloseWait);
-                } else if frame.is_ack() {
-                    self.update_next_ack_num(frame.seq_num() + frame.payload_length() as u32);
-                    self.update_window_size(frame.window_size())
-                } else {
-                    valid = false;
-                }
-            }
-            State::FinWait1 => {
-                if frame.is_fin() && frame.is_ack() {
-                    self.update_state(State::FinWait2);
-                    self.update_next_ack_num(frame.seq_num() + 1);
-                } else if frame.is_fin() {
-                    self.update_state(State::Closing);
-                } else {
-                    valid = false;
-                }
-            }
-            State::FinWait2 => {
-                if frame.is_fin() {
-                    self.update_state(State::TimeWait);
-                } else {
-                    valid = false;
-                }
-            }
-            State::Closing => {
-                if frame.is_fin() && frame.is_ack() {
-                    self.update_state(State::TimeWait);
-                } else {
-                    valid = false;
-                }
-            }
-            State::LastAck => {
-                if frame.is_fin() && frame.is_ack() {
-                    self.update_state(State::Closed);
-                } else {
-                    valid = false;
-                }
-            }
-            _ => valid = false,
-        };
-
-        valid
-    }
-
     pub fn stream_id(&self) -> u32 {
         // we treat ISN as the stream identification. Expecting no collision of it.
         self.init_seq_num
@@ -238,50 +177,6 @@ impl ActiveSession {
         }
         let next_val = self.acknum_counter.get(&ack_num).unwrap() + 1;
         self.acknum_counter.insert(*ack_num, next_val);
-    }
-
-    fn on_send_tcp_frame(&mut self, frame: &TcpFrame) {
-        match self.state {
-            State::Closed => {
-                self.update_state(State::SynSent);
-
-                // In handshake, payload bytes should be treated as 1 bytes.
-                let payload_bytes = 1;
-                self.update_sent_bytes(payload_bytes);
-                self.update_next_seq_num(payload_bytes);
-            }
-            State::SynSent => {
-                self.update_state(self.exepcted_state);
-                self.exepcted_state = State::Closed;
-            }
-            State::Established => {
-                if frame.is_fin() {
-                    self.update_state(State::FinWait1);
-
-                    // In close handshake, payload bytes should be treated as 1 bytes.
-                    let payload_bytes = 1;
-                    self.update_sent_bytes(payload_bytes);
-                    self.update_next_seq_num(payload_bytes);
-                } else {
-                    let payload_bytes = frame.payload_length() as u32;
-                    self.update_sent_bytes(payload_bytes);
-                    self.update_next_seq_num(payload_bytes);
-                }
-            }
-            State::FinWait2 => {
-                self.update_state(State::TimeWait);
-            }
-            State::CloseWait => {
-                self.update_state(State::LastAck);
-            }
-            _ => {}
-        }
-    }
-
-    fn update_state(&mut self, next_state: State) {
-        let prev_state = self.state;
-        self.state = next_state;
-        info!("TCP Session changed state {} -> {}", prev_state, self.state)
     }
 
     fn update_next_seq_num(&mut self, num: u32) {

@@ -84,23 +84,93 @@ impl<'a> Event<'a> {
     }
 }
 
+// ref: https://datatracker.ietf.org/doc/html/rfc793
+//
+//                               +---------+ ---------\      active OPEN
+//                               |  CLOSED |            \    -----------
+//                               +---------+<---------\   \   create TCB
+//                                 |     ^              \   \  snd SYN
+//                    passive OPEN |     |   CLOSE        \   \
+//                    ------------ |     | ----------       \   \ **(1)**
+//                     create TCB  |     | delete TCB         \   \
+//                                 V     |                      \   \
+//                              +---------+            CLOSE    |    \
+//                              |  LISTEN |          ---------- |     |
+//                              +---------+          delete TCB |     |
+//                   rcv SYN      |     |     SEND              |     |
+//                  -----------   |     |    -------            |     V
+// +---------+      snd SYN,ACK  /       \   snd SYN          +---------+
+// |         |<-----------------           ------------------>|         |
+// |   SYN   |                    rcv SYN  **(2), (6)**       |   SYN   |
+// |   RCVD  |<-----------------------------------------------|   SENT  |
+// |         |                    snd ACK  **(3)**            |         |
+// |         |------------------           -------------------|         |
+// +---------+   rcv ACK of SYN  \       /  rcv SYN,ACK       +---------+
+//  |           --------------   |     |   -----------
+//  |                  x         |     |     snd ACK
+//  | **(4)**                    V     V
+//  |  CLOSE                   +---------+
+//  | -------                  |  ESTAB  |
+//  | snd FIN                  +---------+
+//  |                   CLOSE    |     |    rcv FIN
+//  V                  -------   |     |    -------
+// +---------+          snd FIN  /       \   snd ACK          +---------+
+// |  FIN    |<-----------------           ------------------>|  CLOSE  |
+// | WAIT-1  |------------------                              |   WAIT  |
+// +---------+         rcv FIN  \                             +---------+
+// | rcv ACK of FIN   -------   |                            CLOSE  |
+// | --------------   snd ACK   |                           ------- |
+// |        x                   |                                   |
+// V  **(5)**                   V                           snd FIN V
+// +---------+                  +---------+                   +---------+
+// |FINWAIT-2|                  | CLOSING |                   | LAST-ACK|
+// +---------+                  +---------+                   +---------+
+// |                rcv ACK of FIN |                 rcv ACK of FIN |
+// |  rcv FIN       -------------- |    Timeout=2MSL -------------- |
+// |  -------              x       V    ------------        x       V
+//  \ snd ACK               +---------+  delete TCB       +---------+
+// ------------------------>|TIME WAIT|------------------>| CLOSED  |
+//                          +---------+                   +---------+
+//
 pub trait TcpFiniteStateMachineCallbacks {
-    fn on_syn_sent(&mut self);
+    // **(1)**
+    fn on_syn_sent(&mut self, frame: &TcpFrame);
+
+    // **(2)**
+    fn on_wait_send_ack_to_established(&mut self, frame: &TcpFrame);
+
+    // **(3)**
+    fn on_established(&mut self, frame: &TcpFrame);
+
+    // **(4)**
+    fn on_fin_wait1(&mut self, frame: &TcpFrame);
+
+    // **(5)**
+    fn on_fin_wait2(&mut self, frame: &TcpFrame);
+
+    // **(6)**
+    fn on_syn_received(&mut self, frame: &TcpFrame);
 }
 
-struct FiniteStateMachine<'a> {
+struct TcpFiniteStateMachine<'a, T>
+where
+    T: TcpFiniteStateMachineCallbacks,
+{
     state: State,
-    callbacks: &'a dyn TcpFiniteStateMachineCallbacks,
+    callbacks: &'a T,
 }
 
-impl<'a> FiniteStateMachine<'a> {
+impl<'a, T> TcpFiniteStateMachine<'a, T>
+where
+    T: TcpFiniteStateMachineCallbacks,
+{
     pub fn update(&mut self, event: Event) {
         match self.state {
             State::Closed => {
                 if event.frame().is_none() {
-                    self.update_state(State::Listen);
+                    self.update_state(event.frame(), State::Listen);
                 } else if event.frame().is_some() && event.frame().unwrap().is_syn() {
-                    self.update_state(State::SynSent)
+                    self.update_state(event.frame(), State::SynSent)
                 }
             }
             State::Listen => {
@@ -110,12 +180,12 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_recv_frame() && frame_internal.is_syn() {
-                    self.update_state(State::WaitSendAckToSynReceived);
+                    self.update_state(event.frame(), State::WaitSendAckToSynReceived);
                     return;
                 }
 
                 if event.is_send_frame() && frame_internal.is_syn() {
-                    self.update_state(State::SynSent);
+                    self.update_state(event.frame(), State::SynSent);
                 }
             }
             State::SynSent => {
@@ -124,13 +194,13 @@ impl<'a> FiniteStateMachine<'a> {
                 }
                 let frame_internal = event.frame().unwrap();
 
-                if event.is_recv_frame() && frame_internal.is_syn() {
-                    self.update_state(State::SynReceived);
+                if event.is_recv_frame() && frame_internal.is_syn() && frame_internal.is_ack() {
+                    self.update_state(event.frame(), State::WaitSendAckToEstablished);
                     return;
                 }
 
-                if event.is_send_frame() && frame_internal.is_syn() && frame_internal.is_ack() {
-                    self.update_state(State::WaitSendAckToEstablished);
+                if event.is_recv_frame() && frame_internal.is_syn() {
+                    self.update_state(event.frame(), State::SynReceived);
                     return;
                 }
             }
@@ -141,12 +211,12 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_recv_frame() && frame_internal.is_syn() && frame_internal.is_ack() {
-                    self.update_state(State::Established);
+                    self.update_state(event.frame(), State::Established);
                     return;
                 }
 
                 if event.is_send_frame() && frame_internal.is_fin() {
-                    self.update_state(State::FinWait1);
+                    self.update_state(event.frame(), State::FinWait1);
                     return;
                 }
             }
@@ -157,12 +227,12 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_recv_frame() && frame_internal.is_fin() {
-                    self.update_state(State::WaitSendAckToCloseWait);
+                    self.update_state(event.frame(), State::WaitSendAckToCloseWait);
                     return;
                 }
 
                 if event.is_send_frame() && frame_internal.is_fin() {
-                    self.update_state(State::FinWait1);
+                    self.update_state(event.frame(), State::FinWait1);
                     return;
                 }
             }
@@ -173,7 +243,7 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_send_frame() && frame_internal.is_fin() {
-                    self.update_state(State::LastAck);
+                    self.update_state(event.frame(), State::LastAck);
                     return;
                 }
             }
@@ -184,7 +254,7 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_send_frame() && frame_internal.is_ack() && frame_internal.is_fin() {
-                    self.update_state(State::Closed);
+                    self.update_state(event.frame(), State::Closed);
                     return;
                 }
             }
@@ -195,12 +265,12 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_recv_frame() && frame_internal.is_ack() && frame_internal.is_fin() {
-                    self.update_state(State::FinWait2);
+                    self.update_state(event.frame(), State::FinWait2);
                     return;
                 }
 
                 if event.is_recv_frame() && frame_internal.is_fin() {
-                    self.update_state(State::WaitSendAckToClosing);
+                    self.update_state(event.frame(), State::WaitSendAckToClosing);
                     return;
                 }
             }
@@ -211,7 +281,7 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_recv_frame() && frame_internal.is_fin() {
-                    self.update_state(State::WaitSendAckToTimeWait);
+                    self.update_state(event.frame(), State::WaitSendAckToTimeWait);
                     return;
                 }
             }
@@ -222,13 +292,13 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_recv_frame() && frame_internal.is_ack() && frame_internal.is_fin() {
-                    self.update_state(State::TimeWait);
+                    self.update_state(event.frame(), State::TimeWait);
                     return;
                 }
             }
             State::TimeWait => {
                 if event.is_timeout() {
-                    self.update_state(State::Closed);
+                    self.update_state(None, State::Closed);
                 }
             }
             State::WaitSendAckToSynReceived => {
@@ -238,7 +308,7 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_send_frame() && frame_internal.is_ack() {
-                    self.update_state(State::SynReceived);
+                    self.update_state(event.frame(), State::SynReceived);
                 }
             }
             State::WaitSendAckToEstablished => {
@@ -248,7 +318,7 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_send_frame() && frame_internal.is_ack() {
-                    self.update_state(State::Established);
+                    self.update_state(event.frame(), State::Established);
                 }
             }
             State::WaitSendAckToCloseWait => {
@@ -258,7 +328,7 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_send_frame() && frame_internal.is_ack() {
-                    self.update_state(State::CloseWait);
+                    self.update_state(event.frame(), State::CloseWait);
                 }
             }
             State::WaitSendAckToClosing => {
@@ -268,7 +338,7 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_send_frame() && frame_internal.is_ack() {
-                    self.update_state(State::Closing);
+                    self.update_state(event.frame(), State::Closing);
                 }
             }
             State::WaitSendAckToTimeWait => {
@@ -278,15 +348,39 @@ impl<'a> FiniteStateMachine<'a> {
                 let frame_internal = event.frame().unwrap();
 
                 if event.is_send_frame() && frame_internal.is_ack() {
-                    self.update_state(State::TimeWait);
+                    self.update_state(event.frame(), State::TimeWait);
                 }
             }
         }
     }
 
-    fn update_state(&mut self, next_state: State) {
+    fn update_state(&mut self, frame: Option<&TcpFrame>, next_state: State) {
         let prev_state = self.state;
         self.state = next_state;
+
+        if let Some(frame) = frame {
+            match self.state {
+                State::Closed => {}
+                State::Listen => {}
+                State::SynSent => self.callbacks.on_syn_sent(frame),
+                State::SynReceived => self.callbacks.on_syn_received(frame),
+                State::Established => self.callbacks.on_established(frame),
+                State::LastAck => {}
+                State::CloseWait => {}
+                State::FinWait1 => self.callbacks.on_fin_wait1(frame),
+                State::FinWait2 => self.callbacks.on_fin_wait2(frame),
+                State::Closing => {}
+                State::TimeWait => {}
+                State::WaitSendAckToSynReceived => {}
+                State::WaitSendAckToEstablished => {
+                    self.callbacks.on_wait_send_ack_to_established(frame)
+                }
+                State::WaitSendAckToCloseWait => {}
+                State::WaitSendAckToClosing => {}
+                State::WaitSendAckToTimeWait => {}
+            }
+        }
+
         info!("TCP Session changed state {} -> {}", prev_state, self.state)
     }
 }
