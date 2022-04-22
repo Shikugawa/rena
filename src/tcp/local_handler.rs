@@ -79,8 +79,7 @@ impl LocalHandler {
         self.pending_message_queue = VecDeque::with_capacity(pending_buf_size);
 
         // Initial flight
-        let start_idx = next_idx;
-        while next_idx < start_idx + pending_buf_size {
+        while next_idx < pending_buf_size {
             self.send_data_internal(next_idx, raw_packets[next_idx].1.clone())
                 .await;
             next_idx += 1;
@@ -92,15 +91,15 @@ impl LocalHandler {
         // 1) If it has remaining segment, handler sends it.
         // 2) If ACKs can't be received via timeout, handler execute transmission
         //    for failed SYN message immediately.
-        while next_idx < raw_packets.len() {
+        while !self.pending_message_queue.is_empty() {
             let rx = self.rx.as_mut().unwrap();
 
             tokio::select! {
                 instant = interval.tick() => {
-                    while !self.pending_message_queue.is_empty() {
+                    loop {
                         let (_, deadline) = self.pending_message_queue.front().unwrap();
-
-                        if deadline <= &instant {
+                        println!("{:?}", self.pending_message_queue);
+                        if instant < *deadline {
                             break;
                         }
 
@@ -118,17 +117,15 @@ impl LocalHandler {
                     match res {
                         Some(tcp_frame) => {
                             self.pending_message_queue.pop_front().unwrap();
-
                             if !self.session.on_recv(&tcp_frame) {
                                 continue;
                             }
 
-                            next_idx += 1;
-
                             if next_idx >= raw_packets.len() {
-                                break;
+                                continue;
                             }
 
+                            next_idx += 1;
                             self.send_data_internal(next_idx, raw_packets[next_idx].1.clone()).await;
                         }
                         None => {}
@@ -136,7 +133,7 @@ impl LocalHandler {
                 }
             }
         }
-
+        println!("unko");
         self.pending_message_queue.clear();
         Ok(())
     }
@@ -146,12 +143,12 @@ impl LocalHandler {
         let stream_id = self.session.stream_id();
         info!("session {} close handshake", stream_id);
 
-        let packet = self.create_tcp_packet(true);
+        let packet = self.create_tcp_packet(true, true);
         self.send_internal(packet, None).await;
 
         self.recv_packet(None).await;
 
-        let packet = self.create_tcp_packet(false);
+        let packet = self.create_tcp_packet(false, false);
         self.send_internal(packet, None).await;
     }
 
@@ -159,12 +156,12 @@ impl LocalHandler {
         let stream_id = self.session.stream_id();
         info!("session {} start handshake", stream_id);
 
-        let packet = self.create_tcp_packet(false);
+        let packet = self.create_tcp_packet(false, true);
         self.send_internal(packet, None).await;
 
         self.recv_packet(None).await;
 
-        let packet = self.create_tcp_packet(false);
+        let packet = self.create_tcp_packet(false, false);
         self.send_internal(packet, None).await;
     }
 
@@ -208,8 +205,11 @@ impl LocalHandler {
         }
     }
 
-    fn create_tcp_packet(&mut self, close: bool) -> BytesMut {
-        let tcp_frame = self.session.create_next_frame(close).unwrap();
+    fn create_tcp_packet(&mut self, close: bool, should_wait_ack: bool) -> BytesMut {
+        let tcp_frame = self
+            .session
+            .create_next_frame(close, should_wait_ack)
+            .unwrap();
         let packet = TcpPacket::default()
             .set_tcp(tcp_frame.clone())
             .set_ipv4(self.sipaddr, self.dipaddr)

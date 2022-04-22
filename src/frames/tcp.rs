@@ -159,7 +159,7 @@ impl TcpFrame {
         };
 
         if let Some(val) = verify_checksum(&raw_buf, header_length as usize) {
-            warn!("invalid checksum: {:02x}", val);
+            // warn!("invalid checksum: {:02x}", val);
         }
 
         let payload = raw_buf.get_remain_bytes();

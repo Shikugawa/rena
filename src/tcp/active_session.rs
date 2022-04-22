@@ -53,7 +53,7 @@ impl ActiveSession {
         }
     }
 
-    pub fn create_next_frame(&mut self, close: bool) -> Result<TcpFrame> {
+    pub fn create_next_frame(&mut self, close: bool, should_wait_ack: bool) -> Result<TcpFrame> {
         let mut frame = TcpFrame::new(
             self.sipaddr,
             self.dipaddr,
@@ -87,8 +87,10 @@ impl ActiveSession {
             _ => return Err(anyhow!("failed to create TCP frame")),
         }
 
-        let waiting_ack = frame.seq_num() + 1;
-        self.waiting_acks.insert(waiting_ack);
+        if should_wait_ack {
+            let waiting_ack = frame.seq_num() + 1;
+            self.waiting_acks.insert(waiting_ack);
+        }
 
         self.on_send(&frame);
 
@@ -117,7 +119,6 @@ impl ActiveSession {
 
             let waiting_ack = frame.seq_num() + (frame.payload_length() as u32);
             self.waiting_acks.insert(waiting_ack);
-
             self.on_send(&frame);
 
             frames.push(frame);
@@ -133,6 +134,7 @@ impl ActiveSession {
         }
 
         self.waiting_acks.remove(&ack_num);
+
         self.inc_acknum_counter(&ack_num);
         self.update(Event::ReceiveFrame(frame));
 
@@ -259,6 +261,12 @@ impl ActiveSession {
                 if event.is_send_frame() && frame_internal.is_fin() {
                     self.update_state(event.frame(), State::FinWait1);
                     return;
+                }
+
+                if event.is_send_frame() && frame_internal.is_ack() {
+                    let payload_bytes = frame_internal.payload_length() as u32;
+                    self.update_sent_bytes(payload_bytes);
+                    self.update_next_seq_num(payload_bytes);
                 }
             }
             State::CloseWait => {
