@@ -3,7 +3,7 @@ use bytes::{BufMut, BytesMut};
 
 pub const MAX_BUFFER_SIZE: usize = 1024;
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq)]
 pub struct Buffer {
     // TODO: private
     pub start_from: usize,

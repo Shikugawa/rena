@@ -98,7 +98,6 @@ impl LocalHandler {
                 instant = interval.tick() => {
                     loop {
                         let (_, deadline) = self.pending_message_queue.front().unwrap();
-                        println!("{:?}", self.pending_message_queue);
                         if instant < *deadline {
                             break;
                         }
@@ -133,7 +132,7 @@ impl LocalHandler {
                 }
             }
         }
-        println!("unko");
+
         self.pending_message_queue.clear();
         Ok(())
     }

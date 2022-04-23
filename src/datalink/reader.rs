@@ -1,13 +1,12 @@
 use crate::buffer::Buffer;
 use crate::datalink::traits::DatalinkReaderWriter;
 use anyhow::{anyhow, Result};
-use futures::future::poll_fn;
+use futures::Future;
 use nix::libc::{self, EAGAIN};
 use std::fmt;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::unix::AsyncFd;
-use tokio::time::{Duration, Instant};
+use tokio::time::{interval, Duration, Instant};
 
 #[derive(PartialEq)]
 pub enum ReadResult {
@@ -32,41 +31,62 @@ impl ReadResult {
         }
     }
 
-    pub fn data(&self) -> Result<Buffer> {
+    pub fn data(self) -> Result<Buffer> {
         match self {
-            ReadResult::Success(buf) => Ok(buf.to_owned()),
+            ReadResult::Success(buf) => Ok(buf),
             ReadResult::Timeout => Err(anyhow!("read timeout")),
         }
     }
 }
 
-/// Read buffer from datalink
-pub async fn read(reader: Arc<dyn DatalinkReaderWriter>, duration: Option<Duration>) -> ReadResult {
-    let mut buf = Buffer::default();
-    let deadline = if duration.is_some() {
-        Some(Instant::now() + duration.unwrap())
-    } else {
-        None
-    };
+struct ReadFuture {
+    deadline: Option<Instant>,
+    reader: Arc<dyn DatalinkReaderWriter>,
+    pub buf: Buffer,
+}
 
-    let future = poll_fn(|cx: &mut Context<'_>| -> Poll<ReadResult> {
-        if deadline.is_some() && Instant::now() > deadline.unwrap() {
+impl Future for ReadFuture {
+    type Output = ReadResult;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let self_mut = self.get_mut();
+        if self_mut.deadline.is_some() && Instant::now() > self_mut.deadline.unwrap() {
             return Poll::Ready(ReadResult::Timeout);
         }
-        let code = reader.read(&mut buf);
+
+        let code = self_mut.reader.read(&mut self_mut.buf);
 
         if code == EAGAIN as isize || code == -1 {
             cx.waker().wake_by_ref();
-            Poll::Pending
+            return Poll::Pending;
         } else {
-            buf.set_buffer_size(code as usize);
-            Poll::Ready(ReadResult::Success(buf))
+            self_mut.buf.set_buffer_size(code as usize);
+            let owned_buf = std::mem::replace(&mut self_mut.buf, Buffer::default());
+            return Poll::Ready(ReadResult::Success(owned_buf));
         }
-    });
-    if reader.async_fd().readable().await.is_ok() {
-        let res = future.await;
-        return res;
     }
-    // not reached
-    unimplemented!()
+}
+
+fn exec(deadline: Option<Instant>, reader: Arc<dyn DatalinkReaderWriter>) -> ReadFuture {
+    ReadFuture {
+        deadline,
+        buf: Buffer::default(),
+        reader,
+    }
+}
+
+/// Read buffer from datalink
+pub async fn read(reader: Arc<dyn DatalinkReaderWriter>, duration: Option<Duration>) -> ReadResult {
+    if duration.is_none() {
+        let _ = reader.async_fd().readable().await;
+        return exec(None, reader).await;
+    } else {
+        let mut interval = interval(duration.unwrap());
+        let deadline = Instant::now() + duration.unwrap();
+
+        tokio::select! {
+            _ = interval.tick() => ReadResult::Timeout,
+            _ = reader.async_fd().readable() => exec(Some(deadline), reader).await
+        }
+    }
 }
