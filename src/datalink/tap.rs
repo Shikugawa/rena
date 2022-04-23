@@ -16,6 +16,8 @@ use std::{mem, os::unix::prelude::AsRawFd};
 use tokio::fs::OpenOptions;
 use tokio::io::unix::AsyncFd;
 
+use super::traits::DatalinkWriteStatus;
+
 const TAP_DEV: &str = "/dev/net/tun";
 const TUN_IOC_MAGIC: u8 = b'T';
 const TUN_IOC_TYPE_MESSAGE: u8 = 202;
@@ -34,8 +36,8 @@ impl DatalinkReaderWriter for TapDevice {
         0
     }
 
-    fn write(&self, mut buf: BytesMut) -> isize {
-        0
+    fn write(&self, mut buf: BytesMut) -> DatalinkWriteStatus {
+        DatalinkWriteStatus::Succees(0)
     }
 
     fn async_fd(&self) -> &AsyncFd<i32> {

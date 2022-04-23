@@ -2,7 +2,7 @@ use crate::buffer::Buffer;
 use crate::datalink::traits::DatalinkReaderWriter;
 use anyhow::{anyhow, Result};
 use futures::Future;
-use nix::libc::{self, EAGAIN};
+use nix::libc::EAGAIN;
 use std::fmt;
 use std::sync::Arc;
 use std::task::{Context, Poll};

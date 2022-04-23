@@ -8,9 +8,9 @@ use crate::frames::tcp::TcpFrame;
 use crate::packet::TcpPacket;
 use crate::tcp::active_session::ActiveSession;
 use crate::tcp::subscriber::Subscriber;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bytes::BytesMut;
-use log::{info, warn};
+use log::info;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -133,6 +133,7 @@ impl LocalHandler {
             }
         }
 
+        info!("segment write succeded");
         self.pending_message_queue.clear();
         Ok(())
     }

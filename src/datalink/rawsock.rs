@@ -5,7 +5,7 @@ use crate::datalink::traits::DatalinkReaderWriter;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use nix::ifaddrs::getifaddrs;
-use nix::libc;
+use nix::libc::{self, EAGAIN};
 use nix::sys::socket::{bind, socket, AddressFamily, LinkAddr, SockAddr, SockFlag, SockType};
 use std::ffi::c_void;
 use std::os::unix::prelude::AsRawFd;
@@ -15,6 +15,8 @@ use crate::headers::iface::ifreq;
 use nix::ioctl_read_bad;
 use nix::libc::SIOCGIFHWADDR;
 use std::mem;
+
+use super::traits::DatalinkWriteStatus;
 
 pub struct RawSock {
     pub fd: AsyncFd<i32>,
@@ -35,12 +37,12 @@ impl DatalinkReaderWriter for RawSock {
         }
     }
 
-    fn write(&self, mut buf: BytesMut) -> isize {
+    fn write(&self, mut buf: BytesMut) -> DatalinkWriteStatus {
         let link = SockAddr::Link(self.link_addr.unwrap());
         let (ffi_addr, _) = link.as_ffi_pair();
 
         let len = u32::try_from(mem::size_of::<libc::sockaddr_ll>()).unwrap();
-        unsafe {
+        let code = unsafe {
             libc::sendto(
                 self.fd.as_raw_fd(),
                 buf.as_mut_ptr() as *mut c_void,
@@ -49,6 +51,12 @@ impl DatalinkReaderWriter for RawSock {
                 ffi_addr,
                 len,
             )
+        };
+
+        if code == EAGAIN as isize || code == -1 {
+            return DatalinkWriteStatus::Pending(buf);
+        } else {
+            return DatalinkWriteStatus::Succees(code);
         }
     }
 
