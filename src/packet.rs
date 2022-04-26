@@ -1,13 +1,22 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
+use crate::arp_table::ArpTable;
+use crate::datalink::traits::DatalinkReaderWriter;
 use crate::frames::arp::ArpFrame;
 use crate::frames::ethernet::{EtherType, EthernetFrame, EthernetPayload};
 use crate::frames::frame::Frame;
 use crate::frames::icmp::{IcmpFrame, IcmpType};
 use crate::frames::ipv4::{IpProtocol, Ipv4Frame, Ipv4Payload};
 use crate::frames::tcp::TcpFrame;
+use crate::io_handler::IoHandler;
+use crate::tcp::active_session::ActiveSession;
+use anyhow::Result;
 use bytes::BytesMut;
+use log::info;
+use rand::{thread_rng, Rng};
+use std::collections::HashMap;
 use std::mem::swap;
+use std::time::Duration;
 
 enum ArpPacketType {
     ArpRequest(ArpFrame),
@@ -142,44 +151,122 @@ impl IcmpPacket {
     }
 }
 
-#[derive(Default)]
-pub struct TcpPacket {
-    ether: Option<EthernetFrame>,
-    ipv4_packet: Option<Ipv4Frame>,
-    tcp_packet: Option<TcpFrame>,
+pub struct EthernetLayer {
+    smacaddr: MacAddr,
+    arp_table: ArpTable,
 }
 
-impl TcpPacket {
-    pub fn set_ether(mut self, saddr: MacAddr, daddr: MacAddr) -> Self {
-        let mut payload = Ipv4Frame::default();
-        swap(self.ipv4_packet.as_mut().unwrap(), &mut payload);
-        self.ether = Some(EthernetFrame::new(
-            saddr,
-            daddr,
-            EtherType::Ipv4,
-            EthernetPayload::Ipv4Payload(payload),
-        ));
-        self
+impl EthernetLayer {
+    pub fn new(smacaddr: MacAddr) -> Self {
+        Self {
+            smacaddr,
+            arp_table: ArpTable::new(),
+        }
     }
 
-    pub fn set_ipv4(mut self, sipaddr: Ipv4Addr, dipaddr: Ipv4Addr) -> Self {
-        let mut payload = TcpFrame::default();
-        swap(self.tcp_packet.as_mut().unwrap(), &mut payload);
-        self.ipv4_packet = Some(Ipv4Frame::new(
-            sipaddr,
+    pub fn send(&mut self, frame: Ipv4Frame) -> EthernetFrame {
+        let dmacaddr = self.arp_table.lookup(frame.dest_ip_addr()).unwrap();
+        EthernetFrame::new(
+            self.smacaddr,
+            dmacaddr,
+            EtherType::Ipv4,
+            EthernetPayload::Ipv4Payload(frame),
+        )
+    }
+}
+
+pub struct Ipv4Layer {
+    sipaddr: Ipv4Addr,
+}
+
+impl Ipv4Layer {
+    pub fn new(sipaddr: Ipv4Addr) -> Self {
+        Ipv4Layer { sipaddr }
+    }
+
+    pub fn send(&mut self, dipaddr: Ipv4Addr, frame: TcpFrame) -> Ipv4Frame {
+        Ipv4Frame::new(
+            self.sipaddr,
             dipaddr,
             IpProtocol::Tcp,
-            Ipv4Payload::TcpPayload(payload),
-        ));
-        self
+            Ipv4Payload::TcpPayload(frame),
+        )
+    }
+}
+
+pub struct TcpLayer<T>
+where
+    T: DatalinkReaderWriter + 'static,
+{
+    sipaddr: Ipv4Addr,
+    sessions: HashMap<u32, ActiveSession>,
+    io_handler: IoHandler<T>,
+}
+
+impl<T: DatalinkReaderWriter> TcpLayer<T> {
+    pub fn new(sock: T, smacaddr: MacAddr, sipaddr: Ipv4Addr) -> Self {
+        // TODO: graceful close of iohandler
+        let io_handler = IoHandler::new(sock, smacaddr, sipaddr);
+        Self {
+            sessions: HashMap::new(),
+            io_handler,
+            sipaddr,
+        }
     }
 
-    pub fn set_tcp(mut self, frame: TcpFrame) -> Self {
-        self.tcp_packet = Some(frame);
-        self
+    async fn handshake(&mut self, dipaddr: Ipv4Addr, dport: u16) {
+        let mut rand_gen = thread_rng();
+
+        // Same as linux's default range
+        // https://www.kernel.org/doc/html/latest//networking/ip-sysctl.html#ip-variables
+        let sport: u16 = rand_gen.gen_range(32768..60999);
+
+        let mut new_session = ActiveSession::new(self.sipaddr, dipaddr, sport, dport);
+        let stream_id = new_session.stream_id();
+        info!("session {} start handshake", stream_id);
+
+        // send SYN
+        let syn_frame = new_session.create_next_frame(true, true).unwrap();
+        self.send(dipaddr, syn_frame).await;
+
+        // wait ACK
+        let frame = self.wait_valid_frame(&mut new_session, None).await;
+        if frame.is_err() {
+            return;
+        }
+        new_session.on_recv(&frame.unwrap());
+
+        // send SYN
+        let syn_frame = new_session.create_next_frame(true, false).unwrap();
+        self.send(dipaddr, syn_frame).await;
     }
 
-    pub fn build(self) -> BytesMut {
-        self.ether.unwrap().to_bytes()
+    pub async fn read(&mut self) -> Option<TcpFrame> {
+        if let Some(tcp_frame) = self.io_handler.recv().await {
+            Some(tcp_frame)
+        } else {
+            None
+        }
+    }
+
+    pub async fn send(&mut self, dipaddr: Ipv4Addr, frame: TcpFrame) {
+        self.io_handler.send(frame, dipaddr).await;
+    }
+
+    // TODO: timeout
+    async fn wait_valid_frame(
+        &mut self,
+        sess: &mut ActiveSession,
+        timeout: Option<Duration>,
+    ) -> Result<TcpFrame> {
+        loop {
+            if let Some(tcp_frame) = self.read().await {
+                if sess.is_valid_frame(&tcp_frame) {
+                    return Ok(tcp_frame);
+                }
+            } else {
+                continue;
+            }
+        }
     }
 }

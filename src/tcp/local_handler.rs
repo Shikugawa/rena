@@ -5,7 +5,7 @@ use crate::datalink::traits::DatalinkReaderWriter;
 use crate::datalink::writer::{write, WriteResult};
 use crate::frames::frame::Frame;
 use crate::frames::tcp::TcpFrame;
-use crate::packet::TcpPacket;
+// use crate::packet::TcpPacket;
 use crate::tcp::active_session::ActiveSession;
 use crate::tcp::subscriber::Subscriber;
 use anyhow::Result;

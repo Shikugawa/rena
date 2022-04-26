@@ -369,6 +369,10 @@ impl Ipv4Frame {
         frame
     }
 
+    pub fn dest_ip_addr(&self) -> Ipv4Addr {
+        self.dst_ip
+    }
+
     pub fn protocol(&self) -> IpProtocol {
         self.protocol
     }

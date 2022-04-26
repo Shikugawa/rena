@@ -4,6 +4,7 @@ pub mod buffer;
 pub mod datalink;
 pub mod frames;
 mod headers;
+pub mod io_handler;
 pub mod packet;
 pub mod tcp;
 mod utils;

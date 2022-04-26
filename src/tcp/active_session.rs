@@ -127,6 +127,11 @@ impl ActiveSession {
         Ok(frames)
     }
 
+    pub fn is_valid_frame(&self, frame: &TcpFrame) -> bool {
+        let ack_num = frame.ack_num();
+        self.waiting_acks.contains(&ack_num)
+    }
+
     pub fn on_recv(&mut self, frame: &TcpFrame) -> bool {
         let ack_num = frame.ack_num();
         if !self.waiting_acks.contains(&ack_num) {
