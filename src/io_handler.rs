@@ -7,7 +7,7 @@ use crate::frames::ethernet::{EtherType, EthernetFrame};
 use crate::frames::frame::Frame;
 use crate::frames::ipv4::IpProtocol;
 use crate::frames::tcp::TcpFrame;
-use crate::packet::{EthernetLayer, Ipv4Layer};
+use crate::packet::{EthernetLayer, IoThreadLayersStorage, Ipv4Layer};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -17,80 +17,67 @@ where
     T: DatalinkReaderWriter + 'static,
 {
     handle: Option<JoinHandle<()>>,
-    sock: T,
-
-    write_tx: mpsc::Sender<(TcpFrame, Ipv4Addr)>,
-    write_rx: mpsc::Receiver<(TcpFrame, Ipv4Addr)>,
-    read_tx: mpsc::Sender<TcpFrame>,
-    read_rx: mpsc::Receiver<TcpFrame>,
+    sock: Arc<T>,
 }
 
 impl<T> IoHandler<T>
 where
     T: DatalinkReaderWriter + 'static,
 {
-    pub fn new(sock: T, smacaddr: MacAddr, sipaddr: Ipv4Addr) -> Self {
-        let (write_tx, write_rx) = mpsc::channel(1 << 10);
+    pub fn new(
+        sock: T,
+        smacaddr: MacAddr,
+        sipaddr: Ipv4Addr,
+    ) -> (
+        Self,
+        mpsc::Sender<(TcpFrame, Ipv4Addr)>,
+        mpsc::Receiver<TcpFrame>,
+    ) {
+        let (write_tx, mut write_rx) = mpsc::channel(1 << 10);
         let (read_tx, read_rx) = mpsc::channel(1 << 10);
 
         let mut receiver = IoHandler::<T> {
             handle: None,
-            sock,
-            write_tx,
-            write_rx,
-            read_tx,
-            read_rx,
+            sock: Arc::new(sock),
         };
-        receiver.handle = Some(tokio::spawn(async move {
-            async fn handle_ether(read_tx: mpsc::Sender<TcpFrame>, ether: EthernetFrame) {
-                match ether.frame_type() {
-                    EtherType::Arp => unimplemented!("arp"),
-                    EtherType::Ipv4 => {
-                        let ip_frame = ether.ipv4_payload().unwrap().to_owned();
-                        match ip_frame.protocol() {
-                            IpProtocol::Tcp => {
-                                let tcp_frame = ip_frame.tcp_payload().unwrap().to_owned();
-                                read_tx.send(tcp_frame).await;
-                            }
-                            IpProtocol::Icmp | IpProtocol::Unknown => unimplemented!("unknown"),
-                        }
-                    }
-                    EtherType::Ipv6 => unimplemented!("ipv6 not supported"),
-                }
-            }
 
-            let ether_layer = EthernetLayer::new(smacaddr);
-            let ip_layer = Ipv4Layer::new(sipaddr);
+        let sock_clone = receiver.sock.clone();
+
+        receiver.handle = Some(tokio::spawn(async move {
+            // let layer_storage = Arc::new(IoThreadLayersStorage::init(sock_clone, sipaddr, smacaddr));
 
             loop {
                 tokio::select! {
-                    res = receiver.write_rx.recv() => {
+                    res = write_rx.recv() => {
                         let (tcp_frame, dipaddr) = res.unwrap();
-                        let ip_frame = ip_layer.send(dipaddr, tcp_frame);
-                        let ether_frame = ether_layer.send(ip_frame);
-                        write(Arc::new(receiver.sock), ether_frame.to_bytes(), None);
+                        // layer_storage.ipv4_layer().send_tcp_frame(dipaddr, tcp_frame).await;
                     },
-                    res = read(Arc::new(receiver.sock), None) => {
-                      match res {
-                        ReadResult::Success(buf) => {
-                            let ether_frame = EthernetFrame::from_raw(&mut buf);
-                            handle_ether(read_tx, ether_frame);
+                    res = read(sock_clone.clone(), None) => {
+                        match res {
+                            ReadResult::Success(mut buf) => {
+                                let ether = EthernetFrame::from_raw(&mut buf);
+                                match ether.frame_type() {
+                                    EtherType::Arp => unimplemented!("arp"),
+                                    EtherType::Ipv4 => {
+                                        let ip_frame = ether.ipv4_payload().unwrap().to_owned();
+                                        match ip_frame.protocol() {
+                                            IpProtocol::Tcp => {
+                                                let tcp_frame = ip_frame.tcp_payload().unwrap().to_owned();
+                                                let _ = read_tx.send(tcp_frame).await;
+                                            }
+                                            IpProtocol::Icmp | IpProtocol::Unknown => unimplemented!("unknown"),
+                                        }
+                                    }
+                                    EtherType::Ipv6 | EtherType::Unknown => unimplemented!("ipv6 not supported"),
+                                };
+                            }
+                            ReadResult::Timeout => continue
                         }
-                        ReadResult::Timeout => continue
-                      }
                     }
                 }
             }
         }));
-        receiver
-    }
-
-    pub async fn send(&mut self, frame: TcpFrame, dipaddr: Ipv4Addr) {
-        let _ = self.write_tx.send((frame, dipaddr)).await;
-    }
-
-    pub async fn recv(&mut self) -> Option<TcpFrame> {
-        self.read_rx.recv().await
+        (receiver, write_tx, read_rx)
     }
 
     pub async fn close(&mut self) {

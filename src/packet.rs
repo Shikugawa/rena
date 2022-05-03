@@ -1,7 +1,10 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
 use crate::arp_table::ArpTable;
+use crate::datalink::rawsock::RawSock;
+use crate::datalink::tap::TapDevice;
 use crate::datalink::traits::DatalinkReaderWriter;
+use crate::datalink::writer::write;
 use crate::frames::arp::ArpFrame;
 use crate::frames::ethernet::{EtherType, EthernetFrame, EthernetPayload};
 use crate::frames::frame::Frame;
@@ -13,12 +16,18 @@ use crate::tcp::active_session::ActiveSession;
 use anyhow::Result;
 use bytes::BytesMut;
 use log::info;
+use once_cell::sync::Lazy;
 use rand::{thread_rng, Rng};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::mem::swap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
+
+// TODO: thread local
+static mut ARP_TABLE: Lazy<ArpTable> = Lazy::new(|| ArpTable::new());
 
 enum ArpPacketType {
     ArpRequest(ArpFrame),
@@ -153,46 +162,117 @@ impl IcmpPacket {
     }
 }
 
-pub struct EthernetLayer {
+pub struct ArpLayer<T>
+where
+    T: DatalinkReaderWriter + 'static,
+{
     smacaddr: MacAddr,
-    arp_table: ArpTable,
+    sipaddr: Ipv4Addr,
+    layers_storage: Arc<dyn IoThreadLayersStorageWrapper<T>>,
 }
 
-impl EthernetLayer {
-    pub fn new(smacaddr: MacAddr) -> Self {
+impl<T> ArpLayer<T>
+where
+    T: DatalinkReaderWriter + 'static,
+{
+    pub fn new(
+        smacaddr: MacAddr,
+        sipaddr: Ipv4Addr,
+        layers_storage: Arc<dyn IoThreadLayersStorageWrapper<T>>,
+    ) -> Self {
         Self {
             smacaddr,
-            arp_table: ArpTable::new(),
+            sipaddr,
+            layers_storage,
         }
     }
 
-    pub fn send(&mut self, frame: Ipv4Frame) -> EthernetFrame {
-        let dmacaddr = self.arp_table.lookup(frame.dest_ip_addr()).unwrap();
-        EthernetFrame::new(
+    pub async fn send(&self, dipaddr: Ipv4Addr) {
+        let arp_frame = ArpFrame::new_request(self.smacaddr, self.sipaddr, dipaddr);
+    }
+}
+
+pub struct EthernetLayer<T>
+where
+    T: DatalinkReaderWriter + 'static,
+{
+    smacaddr: MacAddr,
+    layers_storage: Arc<dyn IoThreadLayersStorageWrapper<T>>,
+    sock: Arc<T>,
+}
+
+impl<T> EthernetLayer<T>
+where
+    T: DatalinkReaderWriter + 'static,
+{
+    pub fn new(
+        sock: Arc<T>,
+        smacaddr: MacAddr,
+        layers_storage: Arc<dyn IoThreadLayersStorageWrapper<T>>,
+    ) -> EthernetLayer<T> {
+        EthernetLayer {
+            smacaddr,
+            layers_storage,
+            sock,
+        }
+    }
+
+    pub async fn send_ip_frame(&self, frame: Ipv4Frame) {
+        let dmacaddr = unsafe { ARP_TABLE.lookup(frame.dest_ip_addr()).unwrap() };
+
+        let ether = EthernetFrame::new(
             self.smacaddr,
             dmacaddr,
             EtherType::Ipv4,
             EthernetPayload::Ipv4Payload(frame),
-        )
+        );
+        write(self.sock.clone(), ether.to_bytes(), None).await;
+    }
+
+    pub async fn send_arp_frame(&self, frame: ArpFrame) {
+        let ether = EthernetFrame::new(
+            self.smacaddr,
+            MacAddr::from_str("ff:ff:ff:ff:ff:ff").unwrap(),
+            EtherType::Arp,
+            EthernetPayload::ArpPayload(frame),
+        );
+        write(self.sock.clone(), ether.to_bytes(), None).await;
     }
 }
 
-pub struct Ipv4Layer {
+pub struct Ipv4Layer<T>
+where
+    T: DatalinkReaderWriter + 'static,
+{
     sipaddr: Ipv4Addr,
+    layers_storage: Arc<dyn IoThreadLayersStorageWrapper<T>>,
 }
 
-impl Ipv4Layer {
-    pub fn new(sipaddr: Ipv4Addr) -> Self {
-        Ipv4Layer { sipaddr }
+impl<T> Ipv4Layer<T>
+where
+    T: DatalinkReaderWriter + 'static,
+{
+    pub fn new(
+        sipaddr: Ipv4Addr,
+        layers_storage: Arc<dyn IoThreadLayersStorageWrapper<T>>,
+    ) -> Self {
+        Ipv4Layer {
+            sipaddr,
+            layers_storage,
+        }
     }
 
-    pub fn send(&mut self, dipaddr: Ipv4Addr, frame: TcpFrame) -> Ipv4Frame {
-        Ipv4Frame::new(
+    pub async fn send_tcp_frame(&self, dipaddr: Ipv4Addr, frame: TcpFrame) {
+        let ipv4_frame = Ipv4Frame::new(
             self.sipaddr,
             dipaddr,
             IpProtocol::Tcp,
             Ipv4Payload::TcpPayload(frame),
-        )
+        );
+        self.layers_storage
+            .ethernet_layer()
+            .send_ip_frame(ipv4_frame)
+            .await;
     }
 }
 
@@ -203,6 +283,8 @@ where
     sipaddr: Ipv4Addr,
     sessions: HashMap<u16, ActiveSession>,
     io_handler: IoHandler<T>,
+    write_tx: mpsc::Sender<(TcpFrame, Ipv4Addr)>,
+    read_rx: mpsc::Receiver<TcpFrame>,
 
     // pending_message_queue is used to hold inflight segments.
     // If retransmission which is triggered by 1) duplicated ack_num, 2) ack timeout
@@ -213,10 +295,12 @@ where
 impl<T: DatalinkReaderWriter> TcpLayer<T> {
     pub fn new(sock: T, smacaddr: MacAddr, sipaddr: Ipv4Addr) -> Self {
         // TODO: graceful close of iohandler
-        let io_handler = IoHandler::new(sock, smacaddr, sipaddr);
+        let (io_handler, write_tx, read_rx) = IoHandler::new(sock, smacaddr, sipaddr);
         Self {
             sessions: HashMap::new(),
             io_handler,
+            write_tx,
+            read_rx,
             sipaddr,
             pending_message_queue: VecDeque::new(),
         }
@@ -352,7 +436,7 @@ impl<T: DatalinkReaderWriter> TcpLayer<T> {
     }
 
     async fn read(&mut self) -> Option<TcpFrame> {
-        if let Some(tcp_frame) = self.io_handler.recv().await {
+        if let Some(tcp_frame) = self.read_rx.recv().await {
             Some(tcp_frame)
         } else {
             None
@@ -360,12 +444,12 @@ impl<T: DatalinkReaderWriter> TcpLayer<T> {
     }
 
     async fn send_internal(&mut self, dipaddr: Ipv4Addr, frame: TcpFrame) {
-        self.io_handler.send(frame, dipaddr).await;
+        self.write_tx.send((frame, dipaddr)).await;
     }
 
     // TODO: handle timeout if local transmission failed
     async fn send_data_internal(&mut self, idx: usize, dipaddr: Ipv4Addr, frame: TcpFrame) {
-        self.io_handler.send(frame, dipaddr).await;
+        self.write_tx.send((frame, dipaddr)).await;
 
         // TODO: fix backoff timeout
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -404,5 +488,55 @@ impl<T: DatalinkReaderWriter> TcpLayer<T> {
         }
 
         chunked_raw_frames
+    }
+}
+
+// TODO: thread local
+static mut ETHERNET_LAYER_RAW_SOCK: Lazy<Option<EthernetLayer<RawSock>>> = Lazy::new(|| None);
+static mut ARP_LAYER_RAW_SOCK: Lazy<Option<ArpLayer<RawSock>>> = Lazy::new(|| None);
+static mut IPV4_LAYER_RAW_SOCK: Lazy<Option<Ipv4Layer<RawSock>>> = Lazy::new(|| None);
+
+static mut ETHERNET_LAYER_TAP: Lazy<Option<EthernetLayer<TapDevice>>> = Lazy::new(|| None);
+static mut ARP_LAYER_TAP: Lazy<Option<ArpLayer<TapDevice>>> = Lazy::new(|| None);
+static mut IPV4_LAYER_TAP: Lazy<Option<Ipv4Layer<TapDevice>>> = Lazy::new(|| None);
+
+trait IoThreadLayersStorageWrapper<T>
+where
+    T: DatalinkReaderWriter,
+{
+    fn ethernet_layer(&self) -> &EthernetLayer<T>;
+
+    fn arp_layer(&self) -> &ArpLayer<T>;
+
+    fn ipv4_layer(&self) -> &Ipv4Layer<T>;
+}
+
+pub struct IoThreadLayersStorageWrapperRawSock;
+
+impl IoThreadLayersStorageWrapperRawSock {
+    pub fn init(sock: Arc<RawSock>, sipaddr: Ipv4Addr, smacaddr: MacAddr) -> Arc<Self> {
+        let storage = Arc::new(Self {});
+
+        unsafe {
+            ETHERNET_LAYER_RAW_SOCK.insert(EthernetLayer::new(sock, smacaddr, storage));
+            ARP_LAYER_RAW_SOCK.insert(ArpLayer::new(smacaddr, sipaddr, storage));
+            IPV4_LAYER_RAW_SOCK.insert(Ipv4Layer::new(sipaddr, storage));
+        }
+
+        storage
+    }
+}
+
+impl IoThreadLayersStorageWrapper<RawSock> for IoThreadLayersStorageWrapperRawSock {
+    fn ethernet_layer(&self) -> &EthernetLayer<RawSock> {
+        unsafe { &ETHERNET_LAYER_RAW_SOCK.unwrap() }
+    }
+
+    fn arp_layer(&self) -> &ArpLayer<RawSock> {
+        unsafe { &ARP_LAYER_RAW_SOCK.unwrap() }
+    }
+
+    fn ipv4_layer(&self) -> &Ipv4Layer<RawSock> {
+        unsafe { &IPV4_LAYER_RAW_SOCK.unwrap() }
     }
 }
