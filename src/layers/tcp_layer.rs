@@ -9,6 +9,7 @@ use crate::tcp::active_session::ActiveSession;
 use anyhow::Result;
 use bytes::BytesMut;
 use log::info;
+use log::warn;
 use rand::{thread_rng, Rng};
 use std::cmp::min;
 use std::collections::HashMap;
@@ -43,7 +44,7 @@ impl TcpLayer {
     }
 
     pub async fn close(&mut self) {
-      self.io_handler.close().await;
+        self.io_handler.close().await;
     }
 
     pub async fn handshake(&mut self, dipaddr: Ipv4Addr, dport: u16) {
@@ -95,9 +96,7 @@ impl TcpLayer {
 
     pub async fn get_session(
         &mut self,
-        dipaddr: Ipv4Addr,
         dport: u16,
-        payload: BytesMut,
     ) -> Option<&mut ActiveSession> {
         if !self.sessions.contains_key(&dport) {
             return None;
@@ -105,11 +104,10 @@ impl TcpLayer {
         Some(self.sessions.get_mut(&dport).unwrap())
     }
 
-    pub async fn send2(
+    pub async fn send(
         &mut self,
         sess: &mut ActiveSession,
         dipaddr: Ipv4Addr,
-        dport: u16,
         payload: BytesMut,
     ) {
         let tcp_frames = self.create_tcp_data_packet(sess, payload);
@@ -187,12 +185,15 @@ impl TcpLayer {
     }
 
     async fn send_internal(&mut self, dipaddr: Ipv4Addr, frame: TcpFrame) {
-        self.write_tx.send((L4Frame::Tcp(frame), dipaddr)).await;
+      if let Err(err) = self.write_tx.send((L4Frame::Tcp(frame), dipaddr)).await {
+        warn!("{}", err);
+        return;
+      }
     }
 
     // TODO: handle timeout if local transmission failed
     async fn send_data_internal(&mut self, idx: usize, dipaddr: Ipv4Addr, frame: TcpFrame) {
-        self.write_tx.send((L4Frame::Tcp(frame), dipaddr)).await;
+        self.send_internal(dipaddr, frame).await;
 
         // TODO: fix backoff timeout
         let deadline = Instant::now() + Duration::from_secs(3);

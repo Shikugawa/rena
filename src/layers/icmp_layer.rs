@@ -4,6 +4,7 @@ use crate::datalink::rawsock::RawSock;
 use crate::frames::icmp::{IcmpFrame, IcmpType};
 use crate::io::io_handler::{IoHandler, L4Frame};
 use anyhow::Result;
+use log::warn;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -24,20 +25,26 @@ impl IcmpLayer {
     }
 
     pub async fn close(&mut self) {
-      self.io_handler.close().await;
+        self.io_handler.close().await;
     }
 
     pub async fn ping(&mut self, dipaddr: Ipv4Addr) {
         let seq_num = 0;
 
         let frame = IcmpFrame::new(IcmpType::EchoRequest, seq_num);
-        self.write_tx.send((L4Frame::Icmp(frame), dipaddr)).await;
+        self.send_internal(dipaddr, frame).await;
 
-        self.wait_valid_frame(seq_num + 1, None).await;
+        if let Err(err) = self.wait_valid_frame(seq_num + 1, None).await {
+            warn!("{}", err);
+            return;
+        }
     }
 
     async fn send_internal(&mut self, dipaddr: Ipv4Addr, frame: IcmpFrame) {
-        self.write_tx.send((L4Frame::Icmp(frame), dipaddr)).await;
+        if let Err(err) = self.write_tx.send((L4Frame::Icmp(frame), dipaddr)).await {
+            warn!("{}", err);
+            return;
+        }
     }
 
     // TODO: timeout

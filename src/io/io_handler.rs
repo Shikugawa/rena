@@ -9,10 +9,10 @@ use crate::frames::tcp::TcpFrame;
 use crate::layers::storage_wrapper::{
     IoThreadLayersStorageWrapper, IoThreadLayersStorageWrapperRawSock,
 };
+use log::{info, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use log::info;
 
 pub struct IoHandler {
     iothread_handle: Option<JoinHandle<()>>,
@@ -35,7 +35,7 @@ impl IoHandler {
         mpsc::Sender<(L4Frame, Ipv4Addr)>,
         mpsc::Receiver<L4Frame>,
     ) {
-        let (write_tx, mut write_rx) = mpsc::channel(1 << 10);
+        let (write_tx, write_rx) = mpsc::channel(1 << 10);
         let (read_tx, read_rx) = mpsc::channel(1 << 10);
 
         let mut receiver = IoHandler {
@@ -48,9 +48,11 @@ impl IoHandler {
         let write_sock = receiver.sock.clone();
 
         let layer_storage =
-                IoThreadLayersStorageWrapperRawSock::init(write_sock, sipaddr, smacaddr);
-        let (mut event_loop, shutdown_tx) = EventLoop::new(read_sock, write_rx, read_tx, layer_storage);
+            IoThreadLayersStorageWrapperRawSock::init(write_sock, sipaddr, smacaddr);
+        let (mut event_loop, shutdown_tx) =
+            EventLoop::new(read_sock, write_rx, read_tx, layer_storage);
 
+        receiver.shutdown_tx = Some(shutdown_tx);
         receiver.iothread_handle = Some(tokio::spawn(async move {
             info!("Start event loop");
             event_loop.start().await;
@@ -60,10 +62,16 @@ impl IoHandler {
     }
 
     pub async fn close(&mut self) {
-        self.shutdown_tx.as_ref().unwrap().send(true).await;
+        if let Err(err) = self.shutdown_tx.as_ref().unwrap().send(true).await {
+            warn!("{}", err);
+            return;
+        }
 
         let handle = self.iothread_handle.as_mut();
-        handle.unwrap().await;
+        if let Err(err) = handle.unwrap().await {
+            warn!("{}", err);
+            return;
+        }
     }
 }
 
@@ -84,13 +92,16 @@ impl EventLoop {
     ) -> (Self, mpsc::Sender<bool>) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        (Self {
-            read_sock,
-            write_rx,
-            read_tx,
-            shutdown_rx,
-            layer_storage,
-        }, shutdown_tx)
+        (
+            Self {
+                read_sock,
+                write_rx,
+                read_tx,
+                shutdown_rx,
+                layer_storage,
+            },
+            shutdown_tx,
+        )
     }
 
     pub async fn start(&mut self) {
@@ -133,7 +144,10 @@ impl EventLoop {
         match ip_frame.protocol() {
             IpProtocol::Tcp => {
                 let tcp_frame = ip_frame.tcp_payload().unwrap().to_owned();
-                self.read_tx.send(L4Frame::Tcp(tcp_frame)).await;
+                if let Err(err) = self.read_tx.send(L4Frame::Tcp(tcp_frame)).await {
+                    warn!("{}", err);
+                    return;
+                }
             }
             IpProtocol::Icmp => {}
             IpProtocol::Unknown => {}
