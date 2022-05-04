@@ -2,14 +2,13 @@ use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
 use crate::datalink::rawsock::RawSock;
 use crate::datalink::reader::{read, ReadResult};
-use crate::datalink::traits::DatalinkReaderWriter;
-use crate::datalink::writer::write;
 use crate::frames::ethernet::{EtherType, EthernetFrame};
-use crate::frames::frame::Frame;
 use crate::frames::icmp::IcmpFrame;
 use crate::frames::ipv4::IpProtocol;
 use crate::frames::tcp::TcpFrame;
-use crate::layers::storage_wrapper::IoThreadLayersStorageWrapperRawSock;
+use crate::layers::storage_wrapper::{
+    IoThreadLayersStorageWrapper, IoThreadLayersStorageWrapperRawSock,
+};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -48,37 +47,10 @@ impl IoHandler {
         receiver.handle = Some(tokio::spawn(async move {
             let layer_storage =
                 IoThreadLayersStorageWrapperRawSock::init(write_sock, sipaddr, smacaddr);
+            let mut event_loop = EventLoop::new(read_sock, write_rx, read_tx, layer_storage);
 
-            loop {
-                tokio::select! {
-                    res = write_rx.recv() => {
-                        let (tcp_frame, dipaddr) = res.unwrap();
-                        // layer_storage.ipv4_layer().send_tcp_frame(dipaddr, tcp_frame).await;
-                    },
-                    res = read(read_sock.clone(), None) => {
-                        match res {
-                            ReadResult::Success(mut buf) => {
-                                let ether = EthernetFrame::from_raw(&mut buf);
-                                match ether.frame_type() {
-                                    EtherType::Arp => unimplemented!("arp"),
-                                    EtherType::Ipv4 => {
-                                        let ip_frame = ether.ipv4_payload().unwrap().to_owned();
-                                        match ip_frame.protocol() {
-                                            IpProtocol::Tcp => {
-                                                let tcp_frame = ip_frame.tcp_payload().unwrap().to_owned();
-                                                let _ = read_tx.send(L4Frame::Tcp(tcp_frame)).await;
-                                            }
-                                            IpProtocol::Icmp | IpProtocol::Unknown => unimplemented!("unknown"),
-                                        }
-                                    }
-                                    EtherType::Ipv6 | EtherType::Unknown => unimplemented!("ipv6 not supported"),
-                                };
-                            }
-                            ReadResult::Timeout => continue
-                        }
-                    }
-                }
-            }
+            event_loop.start().await;
+            // TODO: graceful loop close
         }));
         (receiver, write_tx, read_rx)
     }
@@ -89,5 +61,86 @@ impl IoHandler {
             // TODO: prepare shutdown signal
             handle.unwrap().await;
         }
+    }
+}
+
+struct EventLoop {
+    read_sock: Arc<RawSock>,
+    write_rx: mpsc::Receiver<(L4Frame, Ipv4Addr)>,
+    read_tx: mpsc::Sender<L4Frame>,
+    layer_storage: IoThreadLayersStorageWrapperRawSock,
+}
+
+impl EventLoop {
+    pub fn new(
+        read_sock: Arc<RawSock>,
+        write_rx: mpsc::Receiver<(L4Frame, Ipv4Addr)>,
+        read_tx: mpsc::Sender<L4Frame>,
+        layer_storage: IoThreadLayersStorageWrapperRawSock,
+    ) -> Self {
+        Self {
+            read_sock,
+            write_rx,
+            read_tx,
+            layer_storage,
+        }
+    }
+
+    pub async fn start(&mut self) {
+        loop {
+            tokio::select! {
+                res = self.write_rx.recv() => {
+                    let (frame, dipaddr) = res.unwrap();
+
+                    match frame {
+                        L4Frame::Tcp(frame) => self.handle_send_tcp(dipaddr, frame).await,
+                        L4Frame::Icmp(frame) => self.handle_send_icmp(dipaddr, frame).await
+                    }
+                },
+                res = read(self.read_sock.clone(), None) => {
+                    let buf = match res {
+                        ReadResult::Success(buf) => Some(buf),
+                        ReadResult::Timeout => None
+                    };
+
+                    if buf.is_none() {
+                        continue;
+                    }
+
+                    let ether = EthernetFrame::from_raw(&mut buf.unwrap());
+                    match ether.frame_type() {
+                        EtherType::Arp => unimplemented!("arp"),
+                        EtherType::Ipv4 => self.handle_recv_ipv4(ether).await,
+                        EtherType::Ipv6 | EtherType::Unknown => unimplemented!("ipv6 not supported"),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn handle_recv_ipv4(&self, ether: EthernetFrame) {
+        let ip_frame = ether.ipv4_payload().unwrap().to_owned();
+        match ip_frame.protocol() {
+            IpProtocol::Tcp => {
+                let tcp_frame = ip_frame.tcp_payload().unwrap().to_owned();
+                self.read_tx.send(L4Frame::Tcp(tcp_frame)).await;
+            }
+            IpProtocol::Icmp => {}
+            IpProtocol::Unknown => {}
+        }
+    }
+
+    async fn handle_send_tcp(&self, dipaddr: Ipv4Addr, frame: TcpFrame) {
+        self.layer_storage
+            .ipv4_layer()
+            .send_tcp_frame(dipaddr, frame)
+            .await;
+    }
+
+    async fn handle_send_icmp(&self, dipaddr: Ipv4Addr, frame: IcmpFrame) {
+        self.layer_storage
+            .ipv4_layer()
+            .send_icmp_frame(dipaddr, frame)
+            .await;
     }
 }

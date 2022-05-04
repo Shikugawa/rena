@@ -1,13 +1,14 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
-use crate::arp_table::ArpTable;
 use crate::datalink::traits::DatalinkReaderWriter;
 use crate::datalink::writer::write;
 use crate::frames::arp::ArpFrame;
 use crate::frames::ethernet::{EtherType, EthernetFrame, EthernetPayload};
 use crate::frames::frame::Frame;
+use crate::frames::icmp::IcmpFrame;
 use crate::frames::ipv4::{IpProtocol, Ipv4Frame, Ipv4Payload};
 use crate::frames::tcp::TcpFrame;
+use crate::layers::shared::arp_table::ArpTable;
 use crate::layers::storage_wrapper::{
     IoThreadLayersStorageWrapper, IoThreadLayersStorageWrapperRawSock,
 };
@@ -119,6 +120,19 @@ impl<T> Ipv4Layer<T> {
             dipaddr,
             IpProtocol::Tcp,
             Ipv4Payload::TcpPayload(frame),
+        );
+        self.layers_storage
+            .ethernet_layer()
+            .send_ip_frame(ipv4_frame)
+            .await;
+    }
+
+    pub async fn send_icmp_frame(&self, dipaddr: Ipv4Addr, frame: IcmpFrame) {
+        let ipv4_frame = Ipv4Frame::new(
+            self.sipaddr,
+            dipaddr,
+            IpProtocol::Icmp,
+            Ipv4Payload::IcmpPayload(frame),
         );
         self.layers_storage
             .ethernet_layer()
