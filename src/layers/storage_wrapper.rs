@@ -48,11 +48,11 @@ impl IoThreadLayersStorageWrapperRawSock {
     pub fn init(sock: Arc<RawSock>, sipaddr: Ipv4Addr, smacaddr: MacAddr) -> Self {
         let storage = Self {};
 
-        // unsafe {
-        //     ETHERNET_LAYER_RAW_SOCK.insert(EthernetLayer::new(sock, smacaddr, storage));
-        //     ARP_LAYER_RAW_SOCK.insert(ArpLayer::new(smacaddr, sipaddr, storage));
-        //     IPV4_LAYER_RAW_SOCK.insert(Ipv4Layer::new(sipaddr, storage));
-        // }
+        unsafe {
+            ETHERNET_LAYER_RAW_SOCK.insert(EthernetLayer::new(sock, smacaddr, storage));
+            ARP_LAYER_RAW_SOCK.insert(ArpLayer::new(smacaddr, sipaddr, storage));
+            IPV4_LAYER_RAW_SOCK.insert(Ipv4Layer::new(sipaddr, storage));
+        }
 
         storage
     }

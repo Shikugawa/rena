@@ -8,7 +8,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub struct IcmpLayer {
-    sipaddr: Ipv4Addr,
     io_handler: IoHandler,
     write_tx: mpsc::Sender<(L4Frame, Ipv4Addr)>,
     read_rx: mpsc::Receiver<L4Frame>,
@@ -16,14 +15,16 @@ pub struct IcmpLayer {
 
 impl IcmpLayer {
     pub fn new(sock: RawSock, smacaddr: MacAddr, sipaddr: Ipv4Addr) -> Self {
-        // TODO: graceful close of iohandler
         let (io_handler, write_tx, read_rx) = IoHandler::new(sock, smacaddr, sipaddr);
         Self {
             io_handler,
             write_tx,
             read_rx,
-            sipaddr,
         }
+    }
+
+    pub async fn close(&mut self) {
+      self.io_handler.close().await;
     }
 
     pub async fn ping(&mut self, dipaddr: Ipv4Addr) {

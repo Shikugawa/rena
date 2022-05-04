@@ -12,9 +12,11 @@ use crate::layers::storage_wrapper::{
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use log::info;
 
 pub struct IoHandler {
-    handle: Option<JoinHandle<()>>,
+    iothread_handle: Option<JoinHandle<()>>,
+    shutdown_tx: Option<mpsc::Sender<bool>>,
     sock: Arc<RawSock>,
 }
 
@@ -37,30 +39,31 @@ impl IoHandler {
         let (read_tx, read_rx) = mpsc::channel(1 << 10);
 
         let mut receiver = IoHandler {
-            handle: None,
+            iothread_handle: None,
+            shutdown_tx: None,
             sock: Arc::new(sock),
         };
 
         let read_sock = receiver.sock.clone();
         let write_sock = receiver.sock.clone();
 
-        receiver.handle = Some(tokio::spawn(async move {
-            let layer_storage =
+        let layer_storage =
                 IoThreadLayersStorageWrapperRawSock::init(write_sock, sipaddr, smacaddr);
-            let mut event_loop = EventLoop::new(read_sock, write_rx, read_tx, layer_storage);
+        let (mut event_loop, shutdown_tx) = EventLoop::new(read_sock, write_rx, read_tx, layer_storage);
 
+        receiver.iothread_handle = Some(tokio::spawn(async move {
+            info!("Start event loop");
             event_loop.start().await;
-            // TODO: graceful loop close
+            info!("Close event loop");
         }));
         (receiver, write_tx, read_rx)
     }
 
     pub async fn close(&mut self) {
-        if self.handle.is_some() {
-            let handle = self.handle.as_mut();
-            // TODO: prepare shutdown signal
-            handle.unwrap().await;
-        }
+        self.shutdown_tx.as_ref().unwrap().send(true).await;
+
+        let handle = self.iothread_handle.as_mut();
+        handle.unwrap().await;
     }
 }
 
@@ -68,6 +71,7 @@ struct EventLoop {
     read_sock: Arc<RawSock>,
     write_rx: mpsc::Receiver<(L4Frame, Ipv4Addr)>,
     read_tx: mpsc::Sender<L4Frame>,
+    shutdown_rx: mpsc::Receiver<bool>,
     layer_storage: IoThreadLayersStorageWrapperRawSock,
 }
 
@@ -77,18 +81,24 @@ impl EventLoop {
         write_rx: mpsc::Receiver<(L4Frame, Ipv4Addr)>,
         read_tx: mpsc::Sender<L4Frame>,
         layer_storage: IoThreadLayersStorageWrapperRawSock,
-    ) -> Self {
-        Self {
+    ) -> (Self, mpsc::Sender<bool>) {
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        (Self {
             read_sock,
             write_rx,
             read_tx,
+            shutdown_rx,
             layer_storage,
-        }
+        }, shutdown_tx)
     }
 
     pub async fn start(&mut self) {
         loop {
             tokio::select! {
+                _ = self.shutdown_rx.recv() => {
+                    break;
+                }
                 res = self.write_rx.recv() => {
                     let (frame, dipaddr) = res.unwrap();
 

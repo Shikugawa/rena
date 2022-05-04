@@ -31,7 +31,6 @@ pub struct TcpLayer {
 
 impl TcpLayer {
     pub fn new(sock: RawSock, smacaddr: MacAddr, sipaddr: Ipv4Addr) -> Self {
-        // TODO: graceful close of iohandler
         let (io_handler, write_tx, read_rx) = IoHandler::new(sock, smacaddr, sipaddr);
         Self {
             sessions: HashMap::new(),
@@ -41,6 +40,10 @@ impl TcpLayer {
             sipaddr,
             pending_message_queue: VecDeque::new(),
         }
+    }
+
+    pub async fn close(&mut self) {
+      self.io_handler.close().await;
     }
 
     pub async fn handshake(&mut self, dipaddr: Ipv4Addr, dport: u16) {
@@ -70,7 +73,7 @@ impl TcpLayer {
         self.send_internal(dipaddr, syn_frame).await;
     }
 
-    pub async fn close(&mut self, sess: &mut ActiveSession, dipaddr: Ipv4Addr, dport: u16) {
+    pub async fn close_session(&mut self, sess: &mut ActiveSession, dipaddr: Ipv4Addr, dport: u16) {
         let stream_id = sess.stream_id();
         info!("session {} start handshake", stream_id);
 
