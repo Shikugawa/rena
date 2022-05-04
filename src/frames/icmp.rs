@@ -131,4 +131,8 @@ impl IcmpFrame {
         frame.cksum = calculate_checksum(frame.to_bytes(), frame.header_length()) as u16;
         frame
     }
+
+    pub fn seq_num(&self) -> u16 {
+        self.seq_num()
+    }
 }
