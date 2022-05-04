@@ -39,13 +39,19 @@ impl ReadResult {
     }
 }
 
-struct ReadFuture {
+struct ReadFuture<T>
+where
+    T: DatalinkReaderWriter,
+{
     deadline: Option<Instant>,
-    reader: Arc<dyn DatalinkReaderWriter>,
+    reader: Arc<T>,
     pub buf: Buffer,
 }
 
-impl Future for ReadFuture {
+impl<T> Future for ReadFuture<T>
+where
+    T: DatalinkReaderWriter,
+{
     type Output = ReadResult;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -67,7 +73,7 @@ impl Future for ReadFuture {
     }
 }
 
-fn exec(deadline: Option<Instant>, reader: Arc<dyn DatalinkReaderWriter>) -> ReadFuture {
+fn exec<T: DatalinkReaderWriter>(deadline: Option<Instant>, reader: Arc<T>) -> ReadFuture<T> {
     ReadFuture {
         deadline,
         buf: Buffer::default(),
@@ -76,7 +82,10 @@ fn exec(deadline: Option<Instant>, reader: Arc<dyn DatalinkReaderWriter>) -> Rea
 }
 
 /// Read buffer from datalink
-pub async fn read(reader: Arc<dyn DatalinkReaderWriter>, duration: Option<Duration>) -> ReadResult {
+pub async fn read<T: DatalinkReaderWriter>(
+    reader: Arc<T>,
+    duration: Option<Duration>,
+) -> ReadResult {
     if duration.is_none() {
         let _ = reader.async_fd().readable().await;
         return exec(None, reader).await;
