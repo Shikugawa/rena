@@ -107,6 +107,16 @@ pub enum IpProtocol {
     Unknown = 0x00FF,
 }
 
+impl IpProtocol {
+    pub fn is_icmp(self) -> bool {
+        self == IpProtocol::Icmp
+    }
+
+    pub fn is_tcp(self) -> bool {
+        self == IpProtocol::Tcp
+    }
+}
+
 impl Default for IpProtocol {
     fn default() -> Self {
         IpProtocol::Unknown

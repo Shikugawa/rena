@@ -1,59 +1,42 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
-use crate::datalink::rawsock::RawSock;
-use crate::datalink::tap::TapDevice;
-use crate::datalink::traits::DatalinkReaderWriter;
-use crate::layers::iothread_layers::{ArpLayer, EthernetLayer, Ipv4Layer};
+use crate::event::event_loop::ThreadEventHandler;
 use once_cell::sync::Lazy;
-use std::sync::Arc;
+
+use super::arp_layer::ArpLayer;
+use super::ether_layer::EthernetLayer;
+use super::ip_layer::Ipv4Layer;
 
 // TODO: thread local
-static mut ETHERNET_LAYER_RAW_SOCK: Lazy<Option<EthernetLayer<RawSock>>> = Lazy::new(|| None);
-static mut ARP_LAYER_RAW_SOCK: Lazy<Option<ArpLayer<RawSock>>> = Lazy::new(|| None);
-static mut IPV4_LAYER_RAW_SOCK: Lazy<Option<Ipv4Layer<RawSock>>> = Lazy::new(|| None);
-
-static mut ETHERNET_LAYER_TAP: Lazy<Option<EthernetLayer<TapDevice>>> = Lazy::new(|| None);
-static mut ARP_LAYER_TAP: Lazy<Option<ArpLayer<TapDevice>>> = Lazy::new(|| None);
-static mut IPV4_LAYER_TAP: Lazy<Option<Ipv4Layer<TapDevice>>> = Lazy::new(|| None);
-
-pub trait IoThreadLayersStorageWrapper<T>
-where
-    T: DatalinkReaderWriter,
-{
-    fn ethernet_layer(&self) -> &EthernetLayer<T>;
-
-    fn arp_layer(&self) -> &ArpLayer<T>;
-
-    fn ipv4_layer(&self) -> &Ipv4Layer<T>;
-}
+static mut ETHERNET_LAYER: Lazy<Option<EthernetLayer>> = Lazy::new(|| None);
+static mut ARP_LAYER: Lazy<Option<ArpLayer>> = Lazy::new(|| None);
+static mut IPV4_LAYER: Lazy<Option<Ipv4Layer>> = Lazy::new(|| None);
 
 #[derive(Clone, Copy)]
-pub struct IoThreadLayersStorageWrapperRawSock;
+pub struct IoThreadLayersStorageWrapper;
 
-impl IoThreadLayersStorageWrapper<RawSock> for IoThreadLayersStorageWrapperRawSock {
-    fn ethernet_layer(&self) -> &EthernetLayer<RawSock> {
-        unsafe { &ETHERNET_LAYER_RAW_SOCK.as_ref().unwrap() }
-    }
-
-    fn arp_layer(&self) -> &ArpLayer<RawSock> {
-        unsafe { &ARP_LAYER_RAW_SOCK.as_ref().unwrap() }
-    }
-
-    fn ipv4_layer(&self) -> &Ipv4Layer<RawSock> {
-        unsafe { &IPV4_LAYER_RAW_SOCK.as_ref().unwrap() }
-    }
-}
-
-impl IoThreadLayersStorageWrapperRawSock {
-    pub fn init(sock: Arc<RawSock>, sipaddr: Ipv4Addr, smacaddr: MacAddr) -> Self {
+impl IoThreadLayersStorageWrapper {
+    pub fn init(event_handler: ThreadEventHandler, sipaddr: Ipv4Addr, smacaddr: MacAddr) -> Self {
         let storage = Self {};
 
         unsafe {
-            ETHERNET_LAYER_RAW_SOCK.insert(EthernetLayer::new(sock, smacaddr, storage));
-            ARP_LAYER_RAW_SOCK.insert(ArpLayer::new(smacaddr, sipaddr, storage));
-            IPV4_LAYER_RAW_SOCK.insert(Ipv4Layer::new(sipaddr, storage));
+            ETHERNET_LAYER.insert(EthernetLayer::new(smacaddr, event_handler, storage));
+            ARP_LAYER.insert(ArpLayer::new(smacaddr, sipaddr, storage));
+            IPV4_LAYER.insert(Ipv4Layer::new(sipaddr, storage));
         }
 
         storage
+    }
+
+    pub fn ethernet_layer(&self) -> &mut EthernetLayer {
+        unsafe { ETHERNET_LAYER.as_mut().unwrap() }
+    }
+
+    pub fn arp_layer(&self) -> &mut ArpLayer {
+        unsafe { ARP_LAYER.as_mut().unwrap() }
+    }
+
+    pub fn ipv4_layer(&self) -> &mut Ipv4Layer {
+        unsafe { IPV4_LAYER.as_mut().unwrap() }
     }
 }

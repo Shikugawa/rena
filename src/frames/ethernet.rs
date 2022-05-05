@@ -19,6 +19,20 @@ pub enum EtherType {
     Unknown = 0xFFFF,
 }
 
+impl EtherType {
+    pub fn is_arp(self) -> bool {
+        self == EtherType::Arp
+    }
+
+    pub fn is_ipv4(self) -> bool {
+        self == EtherType::Ipv4
+    }
+
+    pub fn is_ipv6(self) -> bool {
+        self == EtherType::Ipv6
+    }
+}
+
 impl Default for EtherType {
     fn default() -> Self {
         EtherType::Unknown

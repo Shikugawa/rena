@@ -1,28 +1,23 @@
 use crate::addresses::ipv4::Ipv4Addr;
 use crate::addresses::mac::MacAddr;
-use crate::datalink::rawsock::RawSock;
 use crate::frames::frame::Frame;
 use crate::frames::tcp::TcpFrame;
-use crate::io::io_handler::IoHandler;
-use crate::io::io_handler::L4Frame;
 use crate::tcp::active_session::ActiveSession;
 use anyhow::Result;
 use bytes::BytesMut;
 use log::info;
-use log::warn;
 use rand::{thread_rng, Rng};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use tokio::sync::mpsc;
 use tokio::time::{interval, Duration, Instant};
+
+use super::storage_wrapper::IoThreadLayersStorageWrapper;
 
 pub struct TcpLayer {
     sipaddr: Ipv4Addr,
     sessions: HashMap<u16, ActiveSession>,
-    io_handler: IoHandler,
-    write_tx: mpsc::Sender<(L4Frame, Ipv4Addr)>,
-    read_rx: mpsc::Receiver<L4Frame>,
+    layers_storage: IoThreadLayersStorageWrapper,
 
     // pending_message_queue is used to hold inflight segments.
     // If retransmission which is triggered by 1) duplicated ack_num, 2) ack timeout
@@ -31,20 +26,13 @@ pub struct TcpLayer {
 }
 
 impl TcpLayer {
-    pub fn new(sock: RawSock, smacaddr: MacAddr, sipaddr: Ipv4Addr) -> Self {
-        let (io_handler, write_tx, read_rx) = IoHandler::new(sock, smacaddr, sipaddr);
+    pub fn new(layers_storage: IoThreadLayersStorageWrapper, sipaddr: Ipv4Addr) -> Self {
         Self {
+            layers_storage,
             sessions: HashMap::new(),
-            io_handler,
-            write_tx,
-            read_rx,
             sipaddr,
             pending_message_queue: VecDeque::new(),
         }
-    }
-
-    pub async fn close(&mut self) {
-        self.io_handler.close().await;
     }
 
     pub async fn handshake(&mut self, dipaddr: Ipv4Addr, dport: u16) {
@@ -94,22 +82,14 @@ impl TcpLayer {
         self.send_internal(dipaddr, syn_frame).await;
     }
 
-    pub async fn get_session(
-        &mut self,
-        dport: u16,
-    ) -> Option<&mut ActiveSession> {
+    pub async fn get_session(&mut self, dport: u16) -> Option<&mut ActiveSession> {
         if !self.sessions.contains_key(&dport) {
             return None;
         }
         Some(self.sessions.get_mut(&dport).unwrap())
     }
 
-    pub async fn send(
-        &mut self,
-        sess: &mut ActiveSession,
-        dipaddr: Ipv4Addr,
-        payload: BytesMut,
-    ) {
+    pub async fn send(&mut self, sess: &mut ActiveSession, dipaddr: Ipv4Addr, payload: BytesMut) {
         let tcp_frames = self.create_tcp_data_packet(sess, payload);
 
         let mut next_idx = 0;
@@ -146,7 +126,7 @@ impl TcpLayer {
                         self.send_data_internal(idx, dipaddr, frame).await;
                     }
                 },
-                res = self.read() => {
+                res = self.poll() => {
                     match res {
                         Some(tcp_frame) => {
                             self.pending_message_queue.pop_front().unwrap();
@@ -173,22 +153,27 @@ impl TcpLayer {
         self.pending_message_queue.clear();
     }
 
-    async fn read(&mut self) -> Option<TcpFrame> {
-        if let Some(frame) = self.read_rx.recv().await {
-            return match frame {
-                L4Frame::Tcp(frame) => Some(frame),
-                L4Frame::Icmp(_) => None,
-            };
+    async fn poll(&mut self) -> Option<TcpFrame> {
+        let frame = self.layers_storage.ipv4_layer().poll().await;
+
+        if frame.is_none() {
+            return None;
+        }
+
+        let frame = frame.unwrap();
+
+        if frame.protocol().is_tcp() {
+            Some(frame.tcp_payload().unwrap().to_owned())
         } else {
             None
         }
     }
 
     async fn send_internal(&mut self, dipaddr: Ipv4Addr, frame: TcpFrame) {
-      if let Err(err) = self.write_tx.send((L4Frame::Tcp(frame), dipaddr)).await {
-        warn!("{}", err);
-        return;
-      }
+        self.layers_storage
+            .ipv4_layer()
+            .send_tcp_frame(dipaddr, frame)
+            .await;
     }
 
     // TODO: handle timeout if local transmission failed
@@ -207,7 +192,7 @@ impl TcpLayer {
         timeout: Option<Duration>,
     ) -> Result<TcpFrame> {
         loop {
-            if let Some(tcp_frame) = self.read().await {
+            if let Some(tcp_frame) = self.poll().await {
                 if sess.is_valid_frame(&tcp_frame) {
                     return Ok(tcp_frame);
                 }
