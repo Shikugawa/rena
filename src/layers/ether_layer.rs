@@ -30,14 +30,19 @@ impl EthernetLayer {
     }
 
     pub async fn send_ip_frame(&mut self, frame: Ipv4Frame) {
-        let dmacaddr = unsafe {
-            let dipaddr = frame.dest_ip_addr();
-            ARP_TABLE.lookup(dipaddr).unwrap()
-            // if let Ok(macaddr) = ARP_TABLE.lookup(dipaddr) {
-            //     return macaddr;
-            // }
+        let dipaddr = frame.dest_ip_addr();
+        let res = unsafe { ARP_TABLE.lookup(dipaddr) };
+        let dmacaddr: MacAddr = match res {
+            Ok(addr) => addr,
+            Err(_) => {
+                self.layers_storage
+                    .arp_layer()
+                    .send_arp_frame(dipaddr)
+                    .await;
 
-            // self.layers_storage.arp_layer().send(dipaddr).await;
+                let arp_resp = self.layers_storage.arp_layer().poll().await;
+                arp_resp.unwrap().source_macaddr()
+            }
         };
 
         let frame = EthernetFrame::new(

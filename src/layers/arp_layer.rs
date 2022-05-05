@@ -28,4 +28,21 @@ impl ArpLayer {
             .send_arp_frame(arp_frame)
             .await;
     }
+
+    // TODO: implement poll valid frame
+    pub async fn poll(&self) -> Option<ArpFrame> {
+        let frame = self.layers_storage.ethernet_layer().poll().await;
+
+        if frame.is_none() {
+            return None;
+        }
+
+        let frame = frame.unwrap();
+
+        if frame.frame_type().is_arp() {
+            Some(frame.arp_payload().unwrap().to_owned())
+        } else {
+            None
+        }
+    }
 }

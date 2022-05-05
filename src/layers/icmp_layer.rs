@@ -21,7 +21,7 @@ impl IcmpLayer {
         let frame = IcmpFrame::new(IcmpType::EchoRequest, seq_num);
         self.send_internal(dipaddr, frame).await;
 
-        if let Err(err) = self.wait_valid_frame(seq_num + 1, None).await {
+        if let Err(err) = self.poll_valid_frame(seq_num + 1, None).await {
             warn!("{}", err);
             return;
         }
@@ -35,7 +35,7 @@ impl IcmpLayer {
     }
 
     // TODO: timeout
-    async fn wait_valid_frame(
+    async fn poll_valid_frame(
         &mut self,
         expected_num: u16,
         timeout: Option<Duration>,

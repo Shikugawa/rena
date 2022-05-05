@@ -51,7 +51,7 @@ impl TcpLayer {
         self.send_internal(dipaddr, syn_frame).await;
 
         // wait ACK
-        let frame = self.wait_valid_frame(&mut new_session, None).await;
+        let frame = self.poll_valid_frame(&mut new_session, None).await;
         if frame.is_err() {
             return;
         }
@@ -71,7 +71,7 @@ impl TcpLayer {
         self.send_internal(dipaddr, syn_frame).await;
 
         // wait ACK
-        let frame = self.wait_valid_frame(sess, None).await;
+        let frame = self.poll_valid_frame(sess, None).await;
         if frame.is_err() {
             return;
         }
@@ -186,7 +186,7 @@ impl TcpLayer {
     }
 
     // TODO: timeout
-    async fn wait_valid_frame(
+    async fn poll_valid_frame(
         &mut self,
         sess: &mut ActiveSession,
         timeout: Option<Duration>,
