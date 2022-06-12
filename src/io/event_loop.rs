@@ -3,9 +3,9 @@ use crate::datalink::reader::{read, ReadResult};
 use crate::datalink::writer::write;
 use crate::frames::ethernet::EthernetFrame;
 use crate::frames::frame::Frame;
+use log::error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use log::error;
 
 pub struct EventLoop {
     sock: Arc<RawSock>,

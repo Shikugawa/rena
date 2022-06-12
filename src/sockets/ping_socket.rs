@@ -1,23 +1,21 @@
-use bytes::BytesMut;
-
 use crate::{
     addresses::ipv4::Ipv4Addr,
     datalink::rawsock::RawSock,
     io::{io_handler::IoHandler, thread_event_handler::ThreadEventHandler},
-    layers::thread_local_layer_storage::{create_layers, ThreadLocalStorageCopyableWrapper},
+    layers::thread_local_layer_storage::{create_icmp_layers, ThreadLocalStorageCopyableWrapper},
 };
 
 const CLIENT_THREAD_ID: u64 = 0xdeadbeef;
 
-pub struct TcpClient {
+pub struct PingClient {
     dipaddr: Ipv4Addr,
-    dport: u16,
     layer_storage: ThreadLocalStorageCopyableWrapper,
     io_handler: IoHandler,
+    next_seq_num: u16,
 }
 
-impl TcpClient {
-    pub fn new(iface: &str, dipaddr: Ipv4Addr, dport: u16) -> Self {
+impl PingClient {
+    pub fn new(iface: &str, dipaddr: Ipv4Addr) -> Self {
         let sock = RawSock::new(iface).unwrap();
 
         let smacaddr = sock.mac_addr;
@@ -29,31 +27,21 @@ impl TcpClient {
         // In client mode, thread will be created only once in current implementation,
         // thus we allocated hard-coded thread_id.
         let layer_storage =
-            create_layers(CLIENT_THREAD_ID, thread_event_handler, sipaddr, smacaddr);
-        TcpClient {
+            create_icmp_layers(CLIENT_THREAD_ID, thread_event_handler, sipaddr, smacaddr);
+        PingClient {
             dipaddr,
-            dport,
             layer_storage,
             io_handler,
+            next_seq_num: 0,
         }
     }
 
-    pub async fn handshake(&mut self) {
+    pub async fn ping(&mut self) {
         self.layer_storage
-            .tcp_layer(CLIENT_THREAD_ID)
-            .handshake(self.dipaddr, self.dport)
+            .icmp_layer(CLIENT_THREAD_ID)
+            .send_icmp_echo_request(self.dipaddr, self.next_seq_num)
             .await;
-    }
-
-    pub async fn send(&mut self, payload: BytesMut) {
-        let session = self
-            .layer_storage
-            .tcp_layer(CLIENT_THREAD_ID)
-            .get_session(self.dport);
-        self.layer_storage
-            .tcp_layer(CLIENT_THREAD_ID)
-            .send(session.unwrap(), self.dipaddr, payload)
-            .await;
+        self.next_seq_num += 1;
     }
 
     pub async fn close(&mut self) {

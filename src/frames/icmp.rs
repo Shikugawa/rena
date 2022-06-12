@@ -66,8 +66,10 @@ impl fmt::Display for IcmpFrame {
             "            Type: {}
             Code: {}
             Checksum: {}
+            identifier: {}
+            seq_num: {}
 ",
-            self.icmp_type, self.code, self.cksum
+            self.icmp_type, self.code, self.cksum, self.identifier, self.seq_num
         )
     }
 }

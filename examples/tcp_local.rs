@@ -2,7 +2,7 @@ use std::io;
 
 use bytes::BytesMut;
 use rena::addresses::ipv4::Ipv4Addr;
-use rena::tcp::tcp_socket::TcpClient;
+use rena::sockets::tcp_socket::TcpClient;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]

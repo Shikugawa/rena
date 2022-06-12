@@ -5,5 +5,6 @@ pub mod frames;
 mod headers;
 pub mod io;
 pub mod layers;
+pub mod sockets;
 pub mod tcp;
 mod utils;

@@ -1,5 +1,5 @@
-use tokio::sync::mpsc;
 use log::error;
+use tokio::sync::mpsc;
 
 use crate::frames::ethernet::EthernetFrame;
 

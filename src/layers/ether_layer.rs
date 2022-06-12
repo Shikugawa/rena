@@ -5,8 +5,8 @@ use crate::frames::ethernet::{EtherType, EthernetFrame, EthernetPayload};
 use crate::frames::ipv4::Ipv4Frame;
 use crate::io::thread_event_handler::ThreadEventHandler;
 use crate::layers::shared::arp_table::ArpTable;
-use once_cell::sync::Lazy;
 use log::error;
+use once_cell::sync::Lazy;
 
 // TODO: thread local
 static mut ARP_TABLE: Lazy<ArpTable> = Lazy::new(|| ArpTable::new());

@@ -7,6 +7,7 @@ use once_cell::sync::Lazy;
 
 use super::arp_layer::ArpLayer;
 use super::ether_layer::EthernetLayer;
+use super::icmp_layer::{self, IcmpLayer};
 use super::ip_layer::Ipv4Layer;
 use super::tcp_layer::TcpLayer;
 
@@ -15,6 +16,7 @@ struct Layers {
     arp: Option<ArpLayer>,
     ipv4: Option<Ipv4Layer>,
     tcp: Option<TcpLayer>,
+    icmp: Option<IcmpLayer>,
 }
 
 impl Layers {
@@ -24,6 +26,7 @@ impl Layers {
             arp: None,
             ipv4: None,
             tcp: None,
+            icmp: None,
         }
     }
 
@@ -43,36 +46,28 @@ impl Layers {
         self.tcp = Some(tcp);
     }
 
-    pub fn get_ethernet(&mut self) -> &mut EthernetLayer {
-        if self.ethernet.is_none() {
-            panic!("ethernet layer must be initialized");
-        }
+    pub fn set_icmp(&mut self, icmp: IcmpLayer) {
+        self.icmp = Some(icmp);
+    }
 
+    pub fn get_ethernet(&mut self) -> &mut EthernetLayer {
         self.ethernet.as_mut().unwrap()
     }
 
     pub fn get_arp(&mut self) -> &mut ArpLayer {
-        if self.ipv4.is_none() {
-            panic!("arp layer must be initialized");
-        }
-
         self.arp.as_mut().unwrap()
     }
 
     pub fn get_ipv4(&mut self) -> &mut Ipv4Layer {
-        if self.ipv4.is_none() {
-            panic!("ipv4 layer must be initialized");
-        }
-
         self.ipv4.as_mut().unwrap()
     }
 
     pub fn get_tcp(&mut self) -> &mut TcpLayer {
-        if self.tcp.is_none() {
-            panic!("tcp layer must be initialized");
-        }
-
         self.tcp.as_mut().unwrap()
+    }
+
+    pub fn get_icmp(&mut self) -> &mut IcmpLayer {
+        self.icmp.as_mut().unwrap()
     }
 }
 
@@ -131,6 +126,17 @@ impl ThreadLocalStorage {
             .set_tcp(tcp_layer);
     }
 
+    pub fn set_icmp(&mut self, thread_id: u64, icmp_layer: IcmpLayer) {
+        if !self.storage_map.contains_key(&thread_id) {
+            self.storage_map.insert(thread_id, Layers::new());
+        }
+
+        self.storage_map
+            .get_mut(&thread_id)
+            .unwrap()
+            .set_icmp(icmp_layer);
+    }
+
     pub fn get_ethernet(&mut self, thread_id: u64) -> &mut EthernetLayer {
         if !self.storage_map.contains_key(&thread_id) {
             panic!("invalid thread id {}", thread_id);
@@ -163,6 +169,14 @@ impl ThreadLocalStorage {
         self.storage_map.get_mut(&thread_id).unwrap().get_tcp()
     }
 
+    pub fn get_icmp(&mut self, thread_id: u64) -> &mut IcmpLayer {
+        if !self.storage_map.contains_key(&thread_id) {
+            panic!("invalid thread id {}", thread_id);
+        }
+
+        self.storage_map.get_mut(&thread_id).unwrap().get_icmp()
+    }
+
     pub fn is_thread_layer_exist(&self, thread_id: u64) -> bool {
         self.storage_map.contains_key(&thread_id)
     }
@@ -189,9 +203,13 @@ impl ThreadLocalStorageCopyableWrapper {
     pub fn tcp_layer(&self, thread_id: u64) -> &mut TcpLayer {
         unsafe { THREAD_LOCAL_STORAGE.get_tcp(thread_id) }
     }
+
+    pub fn icmp_layer(&self, thread_id: u64) -> &mut IcmpLayer {
+        unsafe { THREAD_LOCAL_STORAGE.get_icmp(thread_id) }
+    }
 }
 
-pub fn create_layers(
+pub fn create_tcp_layers(
     thread_id: u64,
     event_handler: ThreadEventHandler,
     sipaddr: Ipv4Addr,
@@ -214,6 +232,34 @@ pub fn create_layers(
         );
         THREAD_LOCAL_STORAGE.set_ipv4(thread_id, Ipv4Layer::new(sipaddr, storage, thread_id));
         THREAD_LOCAL_STORAGE.set_tcp(thread_id, TcpLayer::new(storage, sipaddr, thread_id));
+    }
+
+    storage
+}
+
+pub fn create_icmp_layers(
+    thread_id: u64,
+    event_handler: ThreadEventHandler,
+    sipaddr: Ipv4Addr,
+    smacaddr: MacAddr,
+) -> ThreadLocalStorageCopyableWrapper {
+    if unsafe { THREAD_LOCAL_STORAGE.is_thread_layer_exist(thread_id) } {
+        panic!("thread id <{}> has already existed", thread_id);
+    }
+
+    let storage = ThreadLocalStorageCopyableWrapper {};
+
+    unsafe {
+        THREAD_LOCAL_STORAGE.set_ethernet(
+            thread_id,
+            EthernetLayer::new(smacaddr, event_handler, storage, thread_id),
+        );
+        THREAD_LOCAL_STORAGE.set_arp(
+            thread_id,
+            ArpLayer::new(smacaddr, sipaddr, storage, thread_id),
+        );
+        THREAD_LOCAL_STORAGE.set_ipv4(thread_id, Ipv4Layer::new(sipaddr, storage, thread_id));
+        THREAD_LOCAL_STORAGE.set_icmp(thread_id, IcmpLayer::new(storage, thread_id));
     }
 
     storage

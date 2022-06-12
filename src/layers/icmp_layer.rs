@@ -1,5 +1,5 @@
 use crate::addresses::ipv4::Ipv4Addr;
-use crate::frames::icmp::{IcmpFrame, IcmpType};
+use crate::frames::icmp::{self, IcmpFrame, IcmpType};
 use anyhow::Result;
 use log::warn;
 use std::time::Duration;
@@ -21,13 +21,11 @@ impl IcmpLayer {
         }
     }
 
-    pub async fn ping(&mut self, dipaddr: Ipv4Addr) {
-        let seq_num = 0;
-
+    pub async fn send_icmp_echo_request(&mut self, dipaddr: Ipv4Addr, seq_num: u16) {
         let frame = IcmpFrame::new(IcmpType::EchoRequest, seq_num);
         self.send_internal(dipaddr, frame).await;
 
-        if let Err(err) = self.poll_valid_frame(seq_num + 1, None).await {
+        if let Err(err) = self.poll_valid_frame(seq_num, None).await {
             warn!("{}", err);
             return;
         }
@@ -48,7 +46,8 @@ impl IcmpLayer {
     ) -> Result<IcmpFrame> {
         loop {
             if let Some(icmp_frame) = self.poll().await {
-                if icmp_frame.seq_num() == expected_num + 1 {
+                println!("{}", icmp_frame);
+                if icmp_frame.seq_num() == expected_num {
                     return Ok(icmp_frame);
                 }
             } else {
