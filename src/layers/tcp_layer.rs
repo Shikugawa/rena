@@ -1,5 +1,4 @@
 use crate::addresses::ipv4::Ipv4Addr;
-use crate::addresses::mac::MacAddr;
 use crate::frames::frame::Frame;
 use crate::frames::tcp::TcpFrame;
 use crate::tcp::active_session::ActiveSession;
@@ -12,26 +11,34 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use tokio::time::{interval, Duration, Instant};
 
-use super::storage_wrapper::IoThreadLayersStorageWrapper;
+use super::thread_local_layer_storage::ThreadLocalStorageCopyableWrapper;
 
 pub struct TcpLayer {
     sipaddr: Ipv4Addr,
     sessions: HashMap<u16, ActiveSession>,
-    layers_storage: IoThreadLayersStorageWrapper,
+    layers_storage: ThreadLocalStorageCopyableWrapper,
 
     // pending_message_queue is used to hold inflight segments.
     // If retransmission which is triggered by 1) duplicated ack_num, 2) ack timeout
     // is occurred, the number of packet will be enqueued repeatedly here.
     pending_message_queue: VecDeque<(usize, Instant)>,
+
+    // the thread id that EthernetLayer is owned by
+    thread_id: u64,
 }
 
 impl TcpLayer {
-    pub fn new(layers_storage: IoThreadLayersStorageWrapper, sipaddr: Ipv4Addr) -> Self {
+    pub fn new(
+        layers_storage: ThreadLocalStorageCopyableWrapper,
+        sipaddr: Ipv4Addr,
+        thread_id: u64,
+    ) -> Self {
         Self {
             layers_storage,
             sessions: HashMap::new(),
             sipaddr,
             pending_message_queue: VecDeque::new(),
+            thread_id,
         }
     }
 
@@ -60,9 +67,11 @@ impl TcpLayer {
         // send SYN
         let syn_frame = new_session.create_next_frame(false, false).unwrap();
         self.send_internal(dipaddr, syn_frame).await;
+
+        self.sessions.insert(dport, new_session);
     }
 
-    pub async fn close_session(&mut self, sess: &mut ActiveSession, dipaddr: Ipv4Addr, dport: u16) {
+    pub async fn close_session(&mut self, sess: &mut ActiveSession, dipaddr: Ipv4Addr) {
         let stream_id = sess.stream_id();
         info!("session {} start handshake", stream_id);
 
@@ -82,7 +91,7 @@ impl TcpLayer {
         self.send_internal(dipaddr, syn_frame).await;
     }
 
-    pub async fn get_session(&mut self, dport: u16) -> Option<&mut ActiveSession> {
+    pub fn get_session(&mut self, dport: u16) -> Option<&mut ActiveSession> {
         if !self.sessions.contains_key(&dport) {
             return None;
         }
@@ -154,7 +163,7 @@ impl TcpLayer {
     }
 
     async fn poll(&mut self) -> Option<TcpFrame> {
-        let frame = self.layers_storage.ipv4_layer().poll().await;
+        let frame = self.layers_storage.ipv4_layer(self.thread_id).poll().await;
 
         if frame.is_none() {
             return None;
@@ -171,7 +180,7 @@ impl TcpLayer {
 
     async fn send_internal(&mut self, dipaddr: Ipv4Addr, frame: TcpFrame) {
         self.layers_storage
-            .ipv4_layer()
+            .ipv4_layer(self.thread_id)
             .send_tcp_frame(dipaddr, frame)
             .await;
     }

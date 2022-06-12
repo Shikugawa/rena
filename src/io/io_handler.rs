@@ -1,14 +1,8 @@
-use crate::addresses::ipv4::Ipv4Addr;
-use crate::addresses::mac::MacAddr;
 use crate::datalink::rawsock::RawSock;
-use crate::datalink::reader::{read, ReadResult};
-use crate::datalink::writer::write;
-use crate::frames::ethernet::{EtherType, EthernetFrame};
-use crate::frames::frame::Frame;
+use crate::frames::ethernet::EthernetFrame;
 use crate::frames::icmp::IcmpFrame;
-use crate::frames::ipv4::IpProtocol;
 use crate::frames::tcp::TcpFrame;
-use crate::layers::storage_wrapper::IoThreadLayersStorageWrapper;
+use crate::io::event_loop::EventLoop;
 use log::{info, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -27,11 +21,9 @@ pub enum L4Frame {
 impl IoHandler {
     pub fn new(
         sock: RawSock,
-        smacaddr: MacAddr,
-        sipaddr: Ipv4Addr,
     ) -> (
         Self,
-        mpsc::Sender<(EthernetFrame, Ipv4Addr)>,
+        mpsc::Sender<EthernetFrame>,
         mpsc::Receiver<EthernetFrame>,
     ) {
         let (write_tx, write_rx) = mpsc::channel(1 << 10);
@@ -42,7 +34,7 @@ impl IoHandler {
             shutdown_tx: None,
         };
 
-        let (mut event_loop, shutdown_tx) = IoEventLoop::new(Arc::new(sock), write_rx, read_tx);
+        let (mut event_loop, shutdown_tx) = EventLoop::new(Arc::new(sock), write_rx, read_tx);
 
         receiver.shutdown_tx = Some(shutdown_tx);
         receiver.iothread_handle = Some(tokio::spawn(async move {
@@ -63,60 +55,6 @@ impl IoHandler {
         if let Err(err) = handle.unwrap().await {
             warn!("{}", err);
             return;
-        }
-    }
-}
-
-struct IoEventLoop {
-    sock: Arc<RawSock>,
-    write_rx: mpsc::Receiver<(EthernetFrame, Ipv4Addr)>,
-    read_tx: mpsc::Sender<EthernetFrame>,
-    shutdown_rx: mpsc::Receiver<bool>,
-}
-
-impl IoEventLoop {
-    pub fn new(
-        sock: Arc<RawSock>,
-        write_rx: mpsc::Receiver<(EthernetFrame, Ipv4Addr)>,
-        read_tx: mpsc::Sender<EthernetFrame>,
-    ) -> (Self, mpsc::Sender<bool>) {
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-
-        (
-            Self {
-                sock,
-                write_rx,
-                read_tx,
-                shutdown_rx,
-            },
-            shutdown_tx,
-        )
-    }
-
-    pub async fn start(&mut self) {
-        loop {
-            tokio::select! {
-                _ = self.shutdown_rx.recv() => {
-                    break;
-                }
-                res = self.write_rx.recv() => {
-                    let (frame, dipaddr) = res.unwrap();
-                    write(self.sock.clone(), frame.to_bytes(), None).await;
-                },
-                res = read(self.sock.clone(), None) => {
-                    let buf = match res {
-                        ReadResult::Success(buf) => Some(buf),
-                        ReadResult::Timeout => None
-                    };
-
-                    if buf.is_none() {
-                        continue;
-                    }
-
-                    let ether = EthernetFrame::from_raw(&mut buf.unwrap());
-                    self.read_tx.send(ether).await;
-                }
-            }
         }
     }
 }

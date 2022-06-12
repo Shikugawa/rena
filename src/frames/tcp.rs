@@ -6,7 +6,6 @@ use crate::frames::ipv4::IpProtocol;
 use crate::utils::bit_calculation::{extract_u16_from_2u8, extract_u32_from_4u8, push_bytes};
 use crate::utils::checksum::{calculate_checksum, verify_checksum};
 use bytes::{BufMut, BytesMut};
-use log::warn;
 use std::fmt;
 
 const FLAG_NS: u16 = 0x100;

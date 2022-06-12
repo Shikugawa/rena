@@ -1,11 +1,12 @@
-use super::storage_wrapper::IoThreadLayersStorageWrapper;
+use super::thread_local_layer_storage::ThreadLocalStorageCopyableWrapper;
 use crate::addresses::mac::MacAddr;
-use crate::event::event_loop::ThreadEventHandler;
 use crate::frames::arp::ArpFrame;
 use crate::frames::ethernet::{EtherType, EthernetFrame, EthernetPayload};
 use crate::frames::ipv4::Ipv4Frame;
+use crate::io::thread_event_handler::ThreadEventHandler;
 use crate::layers::shared::arp_table::ArpTable;
 use once_cell::sync::Lazy;
+use log::error;
 
 // TODO: thread local
 static mut ARP_TABLE: Lazy<ArpTable> = Lazy::new(|| ArpTable::new());
@@ -13,19 +14,24 @@ static mut ARP_TABLE: Lazy<ArpTable> = Lazy::new(|| ArpTable::new());
 pub struct EthernetLayer {
     smacaddr: MacAddr,
     event_handler: ThreadEventHandler,
-    layers_storage: IoThreadLayersStorageWrapper,
+    layers_storage: ThreadLocalStorageCopyableWrapper,
+
+    // the thread id that EthernetLayer is owned by
+    thread_id: u64,
 }
 
 impl EthernetLayer {
     pub fn new(
         smacaddr: MacAddr,
         event_handler: ThreadEventHandler,
-        layers_storage: IoThreadLayersStorageWrapper,
+        layers_storage: ThreadLocalStorageCopyableWrapper,
+        thread_id: u64,
     ) -> EthernetLayer {
         EthernetLayer {
             smacaddr,
             event_handler,
             layers_storage,
+            thread_id,
         }
     }
 
@@ -36,12 +42,18 @@ impl EthernetLayer {
             Ok(addr) => addr,
             Err(_) => {
                 self.layers_storage
-                    .arp_layer()
+                    .arp_layer(self.thread_id)
                     .send_arp_frame(dipaddr)
                     .await;
 
-                let arp_resp = self.layers_storage.arp_layer().poll().await;
-                arp_resp.unwrap().source_macaddr()
+                let arp_resp = self.layers_storage.arp_layer(self.thread_id).poll().await;
+                let smacaddr = arp_resp.unwrap().source_macaddr();
+
+                if let Err(err) = unsafe { ARP_TABLE.add(dipaddr, smacaddr) } {
+                    error!("{}", err);
+                }
+
+                smacaddr
             }
         };
 
@@ -66,7 +78,7 @@ impl EthernetLayer {
 
     pub async fn poll(&mut self) -> Option<EthernetFrame> {
         match self.event_handler.recv().await {
-            Some((frame, ip)) => Some(frame),
+            Some(frame) => Some(frame),
             None => None,
         }
     }

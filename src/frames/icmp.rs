@@ -133,6 +133,6 @@ impl IcmpFrame {
     }
 
     pub fn seq_num(&self) -> u16 {
-        self.seq_num()
+        self.seq_num
     }
 }

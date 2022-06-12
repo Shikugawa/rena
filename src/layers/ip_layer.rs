@@ -3,18 +3,26 @@ use crate::frames::icmp::IcmpFrame;
 use crate::frames::ipv4::{IpProtocol, Ipv4Frame, Ipv4Payload};
 use crate::frames::tcp::TcpFrame;
 
-use super::storage_wrapper::IoThreadLayersStorageWrapper;
+use super::thread_local_layer_storage::ThreadLocalStorageCopyableWrapper;
 
 pub struct Ipv4Layer {
     sipaddr: Ipv4Addr,
-    layers_storage: IoThreadLayersStorageWrapper,
+    layers_storage: ThreadLocalStorageCopyableWrapper,
+
+    // the thread id that EthernetLayer is owned by
+    thread_id: u64,
 }
 
 impl Ipv4Layer {
-    pub fn new(sipaddr: Ipv4Addr, layers_storage: IoThreadLayersStorageWrapper) -> Self {
+    pub fn new(
+        sipaddr: Ipv4Addr,
+        layers_storage: ThreadLocalStorageCopyableWrapper,
+        thread_id: u64,
+    ) -> Self {
         Ipv4Layer {
             sipaddr,
             layers_storage,
+            thread_id,
         }
     }
 
@@ -27,7 +35,7 @@ impl Ipv4Layer {
         );
 
         self.layers_storage
-            .ethernet_layer()
+            .ethernet_layer(self.thread_id)
             .send_ip_frame(ipv4_frame)
             .await;
     }
@@ -41,13 +49,17 @@ impl Ipv4Layer {
         );
 
         self.layers_storage
-            .ethernet_layer()
+            .ethernet_layer(self.thread_id)
             .send_ip_frame(ipv4_frame)
             .await;
     }
 
     pub async fn poll(&mut self) -> Option<Ipv4Frame> {
-        let frame = self.layers_storage.ethernet_layer().poll().await;
+        let frame = self
+            .layers_storage
+            .ethernet_layer(self.thread_id)
+            .poll()
+            .await;
 
         if frame.is_none() {
             return None;

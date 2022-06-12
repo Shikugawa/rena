@@ -1,7 +1,6 @@
 pub mod addresses;
 pub mod buffer;
 pub mod datalink;
-pub mod event;
 pub mod frames;
 mod headers;
 pub mod io;
